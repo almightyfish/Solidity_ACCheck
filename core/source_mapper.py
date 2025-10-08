@@ -12,14 +12,22 @@ from utils.colors import Colors
 
 
 class SourceMapper:
-    """源码映射器"""
+    """源码映射器（使用solc srcmap）"""
     
-    def __init__(self, source_file: str, output_dir: str):
+    def __init__(self, source_file: str, output_dir: str, 
+                 srcmap_runtime: str = None, runtime_bytecode: str = None):
         self.source_file = source_file
         self.output_dir = output_dir
+        self.srcmap_runtime = srcmap_runtime
+        self.runtime_bytecode = runtime_bytecode
         self.source_lines = []
         self.function_map = {}
+        self.srcmap_entries = []  # 🔧 新增：解析后的srcmap条目
         self._load_and_parse_source()
+        
+        # 🔧 新增：如果有srcmap，则解析它
+        if self.srcmap_runtime:
+            self._parse_srcmap()
     
     def _load_and_parse_source(self):
         """加载并解析源码"""
@@ -64,16 +72,36 @@ class SourceMapper:
             if is_old_constructor:
                 continue
             
+            # 🔧 检查是否是fallback函数（匿名函数）
+            # Solidity 0.4.x: function() payable public
+            # Solidity 0.6.0+: fallback() / receive()
+            fallback_match = re.search(r'\bfunction\s*\(\s*\)', code_part)
+            if fallback_match:
+                # 检查是否是payable（通常fallback都是payable）
+                is_fallback = True
+                function_starts.append((line_num, 'fallback', False, False, is_fallback))
+                continue
+            
+            # 检查新式fallback/receive
+            if 'fallback()' in code_part or 'receive()' in code_part:
+                func_type = 'receive' if 'receive()' in code_part else 'fallback'
+                function_starts.append((line_num, func_type, False, False, True))
+                continue
+            
             # 普通函数
-            func_match = re.search(r'function\s+(\w+|\(\))', code_part)  # 支持 function() 形式
+            func_match = re.search(r'function\s+(\w+)', code_part)
             if func_match:
-                func_name_match = func_match.group(1)
-                # 如果是 () 则使用特殊名称
-                func_name = 'fallback' if func_name_match == '()' else func_name_match
-                function_starts.append((line_num, func_name, False, False))
+                func_name = func_match.group(1)
+                function_starts.append((line_num, func_name, False, False, False))
         
         # 阶段2：为每个函数/modifier分配行号范围
-        for i, (start_line, func_name, is_constructor, is_modifier) in enumerate(function_starts):
+        for i, func_info_tuple in enumerate(function_starts):
+            # 🔧 兼容新旧格式
+            if len(func_info_tuple) == 5:
+                start_line, func_name, is_constructor, is_modifier, is_fallback = func_info_tuple
+            else:
+                start_line, func_name, is_constructor, is_modifier = func_info_tuple
+                is_fallback = False
             # 函数结束位置：下一个函数开始的前一行，或文件结束
             if i + 1 < len(function_starts):
                 end_line = function_starts[i + 1][0] - 1
@@ -118,7 +146,8 @@ class SourceMapper:
                 'lines': list(range(start_line, actual_end + 1)),
                 'variables_used': [],
                 'is_constructor': is_constructor,  # 标记是否是构造函数
-                'is_modifier': is_modifier  # 🔧 新增：标记是否是modifier
+                'is_modifier': is_modifier,  # 标记是否是modifier
+                'is_fallback': is_fallback  # 🔧 新增：标记是否是fallback/receive函数
             }
     
     def _extract_contract_name(self) -> List[str]:
@@ -133,6 +162,117 @@ class SourceMapper:
             if match:
                 contract_names.append(match.group(1))
         return contract_names
+    
+    def _parse_srcmap(self):
+        """
+        🔧 新增：解析Solidity源码映射（srcmap）
+        
+        srcmap格式：s:l:f:j[;s:l:f:j...]
+        - s: 起始字节偏移（在源文件中的位置）
+        - l: 长度（字节数）
+        - f: 文件索引（通常是0）
+        - j: 跳转类型（i=跳入, o=跳出, -=常规）
+        
+        压缩格式：可以省略与前一个相同的值，用空值表示
+        例如: "0:10:0;:5;;;" 表示第二个条目从偏移10开始，长度5
+        """
+        if not self.srcmap_runtime:
+            return
+        
+        entries = self.srcmap_runtime.split(';')
+        prev_values = [0, 0, 0, '-']  # s, l, f, j
+        
+        for entry in entries:
+            parts = entry.split(':')
+            current_values = prev_values.copy()
+            
+            # 解析每个部分，空值表示使用前一个值
+            for i, part in enumerate(parts):
+                if part:  # 非空才更新
+                    if i < 3:  # s, l, f 是数字
+                        current_values[i] = int(part)
+                    else:  # j 是字符
+                        current_values[i] = part
+            
+            # 计算行号和列号
+            line_num, col_num = self._offset_to_line_col(current_values[0])
+            
+            self.srcmap_entries.append({
+                'offset': current_values[0],  # 字节偏移
+                'length': current_values[1],  # 长度
+                'file_index': current_values[2],  # 文件索引
+                'jump_type': current_values[3],  # 跳转类型
+                'line': line_num,  # 源码行号
+                'column': col_num  # 源码列号
+            })
+            
+            prev_values = current_values
+        
+        print(f"  ✓ 解析 srcmap: {len(self.srcmap_entries)} 个条目")
+    
+    def _offset_to_line_col(self, byte_offset: int) -> tuple:
+        """
+        将字节偏移转换为行号和列号
+        
+        Args:
+            byte_offset: 源文件中的字节偏移
+        
+        Returns:
+            (line_num, col_num): 行号（从1开始）和列号（从0开始）
+        """
+        current_offset = 0
+        
+        for line_num, line in enumerate(self.source_lines, 1):
+            line_length = len(line.encode('utf-8'))
+            
+            if current_offset + line_length > byte_offset:
+                # 找到了对应的行
+                col_num = byte_offset - current_offset
+                return (line_num, col_num)
+            
+            current_offset += line_length
+        
+        # 如果超出范围，返回最后一行
+        return (len(self.source_lines), 0)
+    
+    def get_source_location_for_pc(self, pc: int, bytecode_instructions: List) -> Dict:
+        """
+        🔧 新增：根据程序计数器（PC）获取源码位置
+        
+        Args:
+            pc: EVM程序计数器值
+            bytecode_instructions: 反汇编的指令列表
+        
+        Returns:
+            包含行号、列号、代码片段的字典
+        """
+        if not self.srcmap_entries or not bytecode_instructions:
+            return None
+        
+        # 找到PC对应的指令索引
+        instr_index = None
+        for idx, instr in enumerate(bytecode_instructions):
+            if instr.get('pc') == pc:
+                instr_index = idx
+                break
+        
+        if instr_index is None or instr_index >= len(self.srcmap_entries):
+            return None
+        
+        srcmap_entry = self.srcmap_entries[instr_index]
+        line_num = srcmap_entry['line']
+        
+        if line_num < 1 or line_num > len(self.source_lines):
+            return None
+        
+        return {
+            'line': line_num,
+            'column': srcmap_entry['column'],
+            'code': self.source_lines[line_num - 1].strip(),
+            'function': self._find_function_for_line(line_num),
+            'offset': srcmap_entry['offset'],
+            'length': srcmap_entry['length']
+        }
     
     def map_to_source(self, taint_results: List[Dict], bytecode_analyzer) -> List[Dict]:
         """将污点结果映射到源码"""
@@ -180,11 +320,21 @@ class SourceMapper:
                         
                         func_name = usage.get('function')
                         
-                        # 🔧 关键修复2：跳过构造函数中的操作
+                        # 🔧 关键修复2：跳过构造函数、fallback和view/pure函数中的操作
                         if func_name:
                             func_info = self.function_map.get(func_name, {})
                             if func_info.get('is_constructor', False):
                                 # 构造函数中的操作，直接跳过，不标记为危险
+                                continue
+                            if func_info.get('is_fallback', False):
+                                # 🔧 新增：fallback/receive函数是接收以太币的，不是漏洞
+                                # 例如：捐赠合约的fallback函数接收捐款并更新totalReceive
+                                continue
+                            
+                            # 🔧 新增：跳过view/pure函数中的操作
+                            if self._is_view_or_pure_function(func_name):
+                                # view/pure函数不能修改状态，里面的赋值是给返回值赋值
+                                # 例如：function getPet(...) view returns (uint256 genes) { genes = pet.genes; }
                                 continue
                         
                         # 🔧 新方法：利用字节码分析的路径条件信息
@@ -230,10 +380,18 @@ class SourceMapper:
                     
                     func_name = usage.get('function')
                     if func_name:
-                        # 🔧 关键修复2：先检查是否是构造函数
+                        # 🔧 关键修复2：先检查是否是构造函数或fallback
                         func_info = self.function_map.get(func_name, {})
                         if func_info.get('is_constructor', False):
                             # 构造函数中的操作，跳过
+                            continue
+                        if func_info.get('is_fallback', False):
+                            # 🔧 新增：fallback/receive函数，跳过
+                            continue
+                        
+                        # 🔧 新增：跳过view/pure函数
+                        if self._is_view_or_pure_function(func_name):
+                            # view/pure函数不修改状态
                             continue
                         
                         # 检查是否是public函数且无访问控制
@@ -411,6 +569,21 @@ class SourceMapper:
                 return func_name
         return None
     
+    def _is_view_or_pure_function(self, func_name: str) -> bool:
+        """🔧 新增：检查函数是否是view或pure函数"""
+        if not func_name:
+            return False
+        
+        # 在源码中查找函数定义
+        for line in self.source_lines:
+            if f'function {func_name}' in line:
+                # 检查是否包含 view 或 pure 关键字
+                if 'view' in line or 'pure' in line:
+                    return True
+                break
+        
+        return False
+    
     def _check_public_function_has_access_control(self, func_name: str):
         """
         检查public函数是否有访问控制（新增功能）
@@ -430,6 +603,14 @@ class SourceMapper:
         # 🔧 新增：检查是否是modifier
         if func_info.get('is_modifier', False):
             return True, "modifier（由其他函数调用，本身不是漏洞点）"
+        
+        # 🔧 新增：检查是否是fallback/receive函数
+        if func_info.get('is_fallback', False):
+            return True, "fallback/receive函数（接收以太币的函数，任何人都应该能调用）"
+        
+        # 🔧 新增：检查是否是view/pure函数
+        if self._is_view_or_pure_function(func_name):
+            return True, "view/pure函数（只读函数，不修改状态，无需访问控制）"
         
         # 检查函数定义
         for line in self.source_lines:

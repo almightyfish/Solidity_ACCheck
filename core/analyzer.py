@@ -64,8 +64,13 @@ class AllInOneAnalyzer:
             if not taint_analyzer.analyze():
                 return None
             
-            # 步骤5: 源码映射
-            source_mapper = SourceMapper(self.contract_path, self.output_dir)
+            # 步骤5: 源码映射（使用srcmap）
+            source_mapper = SourceMapper(
+                self.contract_path, 
+                self.output_dir,
+                srcmap_runtime=compiler.srcmap_runtime,  # 🔧 新增：传递srcmap
+                runtime_bytecode=compiler.runtime_bytecode  # 🔧 新增：传递bytecode
+            )
             mapped_results = source_mapper.map_to_source(
                 taint_analyzer.taint_results,
                 bytecode_analyzer

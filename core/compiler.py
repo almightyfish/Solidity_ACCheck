@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 from pathlib import Path
+from typing import List, Optional
 from utils.colors import Colors
 
 
@@ -103,8 +104,9 @@ class ContractCompiler:
         self.bytecode = None
         self.runtime_bytecode = None
         self.asm = None
-        self.srcmap = None
-        self.srcmap_runtime = None
+        self.srcmap = None  # 部署时源码映射
+        self.srcmap_runtime = None  # 运行时源码映射
+        self.combined_json = None  # combined.json 数据
     
     def compile(self, contract_path: str) -> bool:
         """编译合约"""
@@ -113,7 +115,25 @@ class ContractCompiler:
         print(f"源文件: {contract_path}")
         
         try:
-            # 编译命令（兼容不同版本）
+            # 🔧 改进：使用 combined-json 获取 srcmap 和 AST
+            # 先生成 combined-json（包含srcmap）
+            combined_json_path = os.path.join(self.output_dir, 'combined.json')
+            cmd_combined = [
+                self.solc_path,
+                '--combined-json', 'bin,bin-runtime,srcmap,srcmap-runtime,asm,ast',
+                contract_path
+            ]
+            
+            print(f"执行命令（combined-json）: {' '.join(cmd_combined)}")
+            result_combined = subprocess.run(cmd_combined, capture_output=True, text=True, timeout=30)
+            
+            if result_combined.returncode == 0:
+                # 保存 combined.json
+                with open(combined_json_path, 'w', encoding='utf-8') as f:
+                    f.write(result_combined.stdout)
+                print(f"✓ Combined JSON 已生成")
+            
+            # 再生成单独的文件（保持兼容性）
             cmd = [
                 self.solc_path,
                 '--bin', '--bin-runtime', '--asm',
@@ -131,12 +151,36 @@ class ContractCompiler:
                 return False
             
             # 读取编译产物
-            contract_name = self._extract_contract_name(contract_path)
+            # 🔧 改进：尝试找到有runtime bytecode的合约
+            contract_names = self._extract_all_contract_names(contract_path)
+            contract_name = self._find_valid_contract(contract_names)
+            
+            if not contract_name:
+                print(f"{Colors.RED}❌ 未找到有效的合约{Colors.ENDC}")
+                return False
+            
+            print(f"  ✓ 选择合约: {contract_name}")
             self._load_artifacts(contract_name)
             
+            # 🔧 新增：加载 combined.json（包含srcmap）
+            self._load_combined_json(combined_json_path, contract_path)
+            
             print(f"{Colors.GREEN}✓ 编译成功{Colors.ENDC}")
-            print(f"  - Runtime bytecode: {len(self.runtime_bytecode)} 字符")
-            print(f"  - Bytecode: {len(self.bytecode)} 字符")
+            # 🔧 修复：处理 None 值（某些合约可能是interface）
+            if self.runtime_bytecode:
+                print(f"  - Runtime bytecode: {len(self.runtime_bytecode)} 字符")
+            else:
+                print(f"  - Runtime bytecode: 未生成（可能是interface）")
+            
+            if self.bytecode:
+                print(f"  - Bytecode: {len(self.bytecode)} 字符")
+            else:
+                print(f"  - Bytecode: 未生成")
+            
+            if self.srcmap_runtime:
+                print(f"  - Runtime srcmap: {len(self.srcmap_runtime.split(';'))} 个映射")
+            if self.srcmap:
+                print(f"  - Deploy srcmap: {len(self.srcmap.split(';'))} 个映射")
             
             # 保存中间结果
             self._save_intermediate_files()
@@ -153,11 +197,39 @@ class ContractCompiler:
             return False
     
     def _extract_contract_name(self, contract_path: str) -> str:
-        """提取合约名称"""
+        """提取合约名称（兼容方法，返回第一个合约）"""
         with open(contract_path, 'r') as f:
             content = f.read()
         match = re.search(r'contract\s+(\w+)', content)
         return match.group(1) if match else Path(contract_path).stem
+    
+    def _extract_all_contract_names(self, contract_path: str) -> List[str]:
+        """🔧 新增：提取所有合约名称"""
+        contract_names = []
+        with open(contract_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                # 匹配 contract ContractName { 或 contract ContractName is ...
+                # 但排除 interface
+                if 'interface' not in line:
+                    match = re.search(r'\bcontract\s+(\w+)', line)
+                    if match:
+                        contract_names.append(match.group(1))
+        return contract_names if contract_names else [Path(contract_path).stem]
+    
+    def _find_valid_contract(self, contract_names: List[str]) -> Optional[str]:
+        """🔧 新增：找到有runtime bytecode的合约"""
+        for contract_name in contract_names:
+            # 检查是否有runtime bytecode文件
+            runtime_file = os.path.join(self.output_dir, f"{contract_name}.bin-runtime")
+            if os.path.exists(runtime_file):
+                # 检查文件是否为空
+                with open(runtime_file, 'r') as f:
+                    content = f.read().strip()
+                    if content:  # 有内容
+                        return contract_name
+        
+        # 如果都没有runtime bytecode，返回第一个
+        return contract_names[0] if contract_names else None
     
     def _load_artifacts(self, contract_name: str):
         """加载编译产物"""
@@ -176,14 +248,52 @@ class ContractCompiler:
                 with open(file_path, 'r') as f:
                     setattr(self, attr, f.read().strip())
     
+    def _load_combined_json(self, combined_json_path: str, contract_path: str):
+        """加载 combined.json 并提取 srcmap"""
+        if not os.path.exists(combined_json_path):
+            print(f"  ⚠️  未找到 combined.json")
+            return
+        
+        import json
+        with open(combined_json_path, 'r', encoding='utf-8') as f:
+            self.combined_json = json.load(f)
+        
+        # 提取 srcmap（需要找到正确的合约键）
+        # combined.json 的格式: {"contracts": {"path:ContractName": {...}}}
+        contracts = self.combined_json.get('contracts', {})
+        
+        # 查找包含当前合约路径的键
+        for contract_key, contract_data in contracts.items():
+            if contract_path in contract_key or os.path.basename(contract_path) in contract_key:
+                self.srcmap = contract_data.get('srcmap', '')
+                self.srcmap_runtime = contract_data.get('srcmap-runtime', '')
+                print(f"  ✓ 加载 srcmap: {contract_key}")
+                break
+    
     def _save_intermediate_files(self):
         """保存中间文件"""
         intermediate_dir = os.path.join(self.output_dir, "intermediate")
         os.makedirs(intermediate_dir, exist_ok=True)
         
-        # 保存runtime bytecode
-        with open(os.path.join(intermediate_dir, "runtime_bytecode.hex"), 'w') as f:
-            f.write(self.runtime_bytecode)
+        # 保存runtime bytecode（如果存在）
+        if self.runtime_bytecode:
+            with open(os.path.join(intermediate_dir, "runtime_bytecode.hex"), 'w') as f:
+                f.write(self.runtime_bytecode)
+        
+        # 🔧 新增：保存 srcmap
+        if self.srcmap_runtime:
+            with open(os.path.join(intermediate_dir, "srcmap_runtime.txt"), 'w', encoding='utf-8') as f:
+                f.write(self.srcmap_runtime)
+        
+        if self.srcmap:
+            with open(os.path.join(intermediate_dir, "srcmap.txt"), 'w', encoding='utf-8') as f:
+                f.write(self.srcmap)
+        
+        # 保存 combined.json
+        if self.combined_json:
+            import json
+            with open(os.path.join(intermediate_dir, "combined.json"), 'w', encoding='utf-8') as f:
+                json.dump(self.combined_json, f, indent=2, ensure_ascii=False)
         
         print(f"  → 中间文件已保存到: {intermediate_dir}/")
 
