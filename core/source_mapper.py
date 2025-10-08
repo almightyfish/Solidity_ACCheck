@@ -1,0 +1,604 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+源码映射模块
+"""
+
+import json
+import os
+import re
+from typing import List, Dict, Optional
+from utils.colors import Colors
+
+
+class SourceMapper:
+    """源码映射器"""
+    
+    def __init__(self, source_file: str, output_dir: str):
+        self.source_file = source_file
+        self.output_dir = output_dir
+        self.source_lines = []
+        self.function_map = {}
+        self._load_and_parse_source()
+    
+    def _load_and_parse_source(self):
+        """加载并解析源码"""
+        with open(self.source_file, 'r', encoding='utf-8') as f:
+            self.source_lines = f.readlines()
+        
+        # 提取合约名称（用于识别构造函数）
+        self.contract_names = self._extract_contract_name()  # 改为复数，返回列表
+        
+        # 两阶段解析：先找所有函数/modifier定义，再分配行号
+        function_starts = []  # [(line_num, func_name, is_constructor, is_modifier), ...]
+        
+        # 阶段1：找到所有函数/modifier定义（排除注释）
+        for line_num, line in enumerate(self.source_lines, 1):
+            # 移除注释后再匹配
+            code_part = line.split('//')[0]  # 移除单行注释
+            
+            # 🔧 新增：检查是否是 modifier
+            modifier_match = re.search(r'\bmodifier\s+(\w+)', code_part)
+            if modifier_match:
+                modifier_name = modifier_match.group(1)
+                function_starts.append((line_num, modifier_name, False, True))
+                continue
+            
+            # 检查是否是构造函数 (Solidity 0.5.0+)
+            constructor_match = re.search(r'\bconstructor\s*\(', code_part)
+            if constructor_match:
+                function_starts.append((line_num, 'constructor', True, False))
+                continue
+            
+            # 检查是否是老式构造函数 (Solidity 0.4.x: function ContractName)
+            # 🔧 修复：检查是否匹配任何一个合约名
+            is_old_constructor = False
+            if self.contract_names:
+                for contract_name in self.contract_names:
+                    old_constructor_match = re.search(rf'\bfunction\s+{re.escape(contract_name)}\s*\(', code_part)
+                    if old_constructor_match:
+                        function_starts.append((line_num, 'constructor', True, False))
+                        is_old_constructor = True
+                        break
+            
+            if is_old_constructor:
+                continue
+            
+            # 普通函数
+            func_match = re.search(r'function\s+(\w+|\(\))', code_part)  # 支持 function() 形式
+            if func_match:
+                func_name_match = func_match.group(1)
+                # 如果是 () 则使用特殊名称
+                func_name = 'fallback' if func_name_match == '()' else func_name_match
+                function_starts.append((line_num, func_name, False, False))
+        
+        # 阶段2：为每个函数/modifier分配行号范围
+        for i, (start_line, func_name, is_constructor, is_modifier) in enumerate(function_starts):
+            # 函数结束位置：下一个函数开始的前一行，或文件结束
+            if i + 1 < len(function_starts):
+                end_line = function_starts[i + 1][0] - 1
+            else:
+                end_line = len(self.source_lines)
+            
+            # 使用大括号计数+缩进判断精确确定函数结束位置
+            brace_count = 0
+            actual_end = end_line
+            found_opening_brace = False
+            
+            # 获取函数定义行的缩进级别
+            func_def_line = self.source_lines[start_line - 1]
+            func_indent = len(func_def_line) - len(func_def_line.lstrip())
+            
+            for line_num in range(start_line, min(end_line + 1, len(self.source_lines) + 1)):
+                line = self.source_lines[line_num - 1]
+                
+                # 检查是否有左大括号（函数体开始）
+                if '{' in line:
+                    found_opening_brace = True
+                
+                brace_count += line.count('{') - line.count('}')
+                
+                # 函数体完全闭合的条件（关键改进：使用缩进判断）：
+                # 1. 已经找到过左大括号（函数体已开始）
+                # 2. 当前brace_count==0（大括号已经全部配对）
+                # 3. 当前行包含右大括号
+                # 4. 当前行的缩进 <= 函数定义行的缩进（同级或更外层，说明是函数级别的}）
+                if found_opening_brace and brace_count == 0 and '}' in line and line_num > start_line:
+                    line_indent = len(line) - len(line.lstrip())
+                    stripped = line.strip()
+                    
+                    # 是函数级别的} （缩进与函数定义同级或更外层）
+                    if (stripped == '}' or stripped.startswith('}')) and line_indent <= func_indent:
+                        actual_end = line_num
+                        break
+            
+            self.function_map[func_name] = {
+                'start_line': start_line,
+                'end_line': actual_end,
+                'lines': list(range(start_line, actual_end + 1)),
+                'variables_used': [],
+                'is_constructor': is_constructor,  # 标记是否是构造函数
+                'is_modifier': is_modifier  # 🔧 新增：标记是否是modifier
+            }
+    
+    def _extract_contract_name(self) -> List[str]:
+        """提取所有合约名称（用于识别老式构造函数）
+        
+        注意：一个文件可能包含多个合约定义
+        """
+        contract_names = []
+        for line in self.source_lines:
+            # 匹配 contract ContractName { 或 contract ContractName is ...
+            match = re.search(r'\bcontract\s+(\w+)', line)
+            if match:
+                contract_names.append(match.group(1))
+        return contract_names
+    
+    def map_to_source(self, taint_results: List[Dict], bytecode_analyzer) -> List[Dict]:
+        """将污点结果映射到源码"""
+        print(f"\n{Colors.HEADER}【步骤5】源码映射{Colors.ENDC}")
+        print("-" * 80)
+        
+        mapped_results = []
+        
+        for taint_result in taint_results:
+            var_name = taint_result['name']
+            has_taint = len(taint_result['taint_bb']) > 0
+            
+            # 查找变量在源码中的使用
+            usages = self._find_variable_usage(var_name)
+            
+            # 分析路径类型（新增）
+            dangerous_paths = []  # 无条件判断的危险路径
+            suspicious_paths = []  # 有条件判断的可疑路径
+            
+            if has_taint and 'paths_with_conditions' in taint_result:
+                for path_info in taint_result['paths_with_conditions']:
+                    if path_info['has_condition']:
+                        suspicious_paths.append(path_info['path'])
+                    else:
+                        dangerous_paths.append(path_info['path'])
+            
+            # 标记风险位置（区分危险和可疑）
+            # 关键改进：只检查写入操作，排除读取操作（如条件判断中的变量）
+            dangerous_locations = []
+            suspicious_locations = []
+            
+            # 改进1: 基于污点分析的检测（使用字节码层面的条件信息）
+            # 🔧 关键改进：利用字节码分析得到的路径条件信息，而非源码模式匹配
+            if has_taint:
+                # 构建写入操作到污点路径的映射
+                # 通过检查写入操作所在的基本块是否在有条件的污点路径上
+                for usage in usages:
+                    # 核心修复：只有写入操作才可能是风险位置
+                    if usage['operation'] == 'write':
+                        # 🔧 关键修复1：跳过变量声明（不是运行时风险）
+                        if usage.get('type') == 'declaration':
+                            # 变量声明（如 uint256 constant BET = 100）不是运行时操作
+                            # 不应该被标记为风险
+                            continue
+                        
+                        func_name = usage.get('function')
+                        
+                        # 🔧 关键修复2：跳过构造函数中的操作
+                        if func_name:
+                            func_info = self.function_map.get(func_name, {})
+                            if func_info.get('is_constructor', False):
+                                # 构造函数中的操作，直接跳过，不标记为危险
+                                continue
+                        
+                        # 🔧 新方法：利用字节码分析的路径条件信息
+                        # 检查是否所有包含此写入的污点路径都有条件判断
+                        has_path_condition = False
+                        has_path_without_condition = False
+                        
+                        if 'paths_with_conditions' in taint_result:
+                            for path_info in taint_result['paths_with_conditions']:
+                                if path_info['has_condition']:
+                                    has_path_condition = True
+                                else:
+                                    has_path_without_condition = True
+                        
+                        # 同时检查源码级别的访问控制（作为补充）
+                        has_source_condition = self._check_source_has_condition(usage)
+                        
+                        # 综合判断：字节码条件 + 源码访问控制
+                        has_protection = has_path_condition or has_source_condition
+                        
+                        location_info = usage.copy()
+                        location_info['has_bytecode_condition'] = has_path_condition  # 🆕 字节码层面的条件
+                        location_info['has_source_condition'] = has_source_condition  # 源码层面的条件
+                        location_info['detection_method'] = 'taint_analysis'
+                        
+                        # 🔧 改进后的逻辑：
+                        # 1. 如果字节码路径或源码都有保护 → 可疑（需人工审查）
+                        # 2. 如果完全没有保护 → 危险（需立即修复）
+                        if has_protection:
+                            suspicious_locations.append(location_info)
+                        else:
+                            dangerous_locations.append(location_info)
+                    # 读取操作（如 if (keyHash == 0x0)）不会被标记为风险
+            
+            # 改进2: 补充检测 - public函数写入关键变量但无访问控制（新增）
+            # 即使污点分析失败，也能通过此机制检测到漏洞
+            for usage in usages:
+                if usage['operation'] == 'write':
+                    # 🔧 关键修复1：跳过变量声明（不是运行时风险）
+                    if usage.get('type') == 'declaration':
+                        # 变量声明不是运行时操作，跳过
+                        continue
+                    
+                    func_name = usage.get('function')
+                    if func_name:
+                        # 🔧 关键修复2：先检查是否是构造函数
+                        func_info = self.function_map.get(func_name, {})
+                        if func_info.get('is_constructor', False):
+                            # 构造函数中的操作，跳过
+                            continue
+                        
+                        # 检查是否是public函数且无访问控制
+                        has_ac, reason = self._check_public_function_has_access_control(func_name)
+                        
+                        if not has_ac:  # public函数无访问控制
+                            # 检查是否已经被标记（避免重复）
+                            already_flagged = any(
+                                loc['line'] == usage['line'] and loc['function'] == func_name
+                                for loc in dangerous_locations + suspicious_locations
+                            )
+                            
+                            if not already_flagged:
+                                # 🔧 关键修复：即使无访问控制，也要检查是否有条件判断
+                                has_source_condition = self._check_source_has_condition(usage)
+                                
+                                location_info = usage.copy()
+                                location_info['has_source_condition'] = has_source_condition
+                                location_info['detection_method'] = 'public_function_check'
+                                location_info['warning'] = f"⚠️ {reason}"
+                                
+                                # 🔧 根据条件判断决定是危险还是可疑
+                                if has_source_condition:
+                                    # 有条件判断（require/if等） → 可疑
+                                    suspicious_locations.append(location_info)
+                                else:
+                                    # 完全没有条件保护 → 危险
+                                    dangerous_locations.append(location_info)
+            
+            # 重新计算：如果补充检测发现了危险位置，也应标记为有漏洞
+            has_vulnerability = has_taint or len(dangerous_locations) > 0 or len(suspicious_locations) > 0
+            
+            # 🔧 重新计算路径统计：基于实际的危险和可疑位置
+            # 而不是使用污点分析阶段的路径统计（那时候还包含构造函数）
+            actual_dangerous_count = len(dangerous_locations)
+            actual_suspicious_count = len(suspicious_locations)
+            
+            mapped = {
+                'variable': var_name,
+                'storage_slot': taint_result['offset'],
+                'has_taint': has_taint,
+                'has_vulnerability': has_vulnerability,  # 新增：综合判断
+                'taint_paths_count': len(taint_result['taint_cfg']),
+                'dangerous_paths_count': actual_dangerous_count,  # 🔧 修复：使用实际的危险位置数量
+                'suspicious_paths_count': actual_suspicious_count,  # 🔧 修复：使用实际的可疑位置数量
+                'affected_basic_blocks': taint_result['taint_bb'],
+                'source_usages': usages,
+                'dangerous_locations': dangerous_locations,  # 新增：危险位置（无保护）
+                'suspicious_locations': suspicious_locations,  # 新增：可疑位置（有保护）
+                'risk_locations': dangerous_locations + suspicious_locations  # 保持兼容性
+            }
+            
+            mapped_results.append(mapped)
+        
+        # 🔧 新增：检测敏感函数
+        print(f"\n{Colors.HEADER}【额外检测】敏感函数分析{Colors.ENDC}")
+        print("-" * 80)
+        sensitive_functions = self._check_sensitive_functions()
+        
+        if sensitive_functions:
+            print(f"{Colors.YELLOW}⚠️  发现 {len(sensitive_functions)} 个敏感函数调用{Colors.ENDC}")
+            for sf in sensitive_functions:
+                risk_color = Colors.GREEN if sf['has_access_control'] else Colors.RED
+                risk_icon = "✅" if sf['has_access_control'] else "❌"
+                print(f"  {risk_icon} 行 {sf['line']:4d}: {sf['keyword']} - {sf['description']}")
+                print(f"     函数: {sf['function']}, 访问控制: {sf['control_reason']}")
+        else:
+            print(f"{Colors.GREEN}✓ 未发现敏感函数调用{Colors.ENDC}")
+        
+        print(f"\n{Colors.GREEN}✓ 源码映射完成{Colors.ENDC}")
+        print(f"  - 映射变量: {len(mapped_results)} 个")
+        print(f"  - 敏感函数: {len(sensitive_functions)} 个")
+        
+        # 保存结果（包含敏感函数信息）
+        self._save_mapped_results(mapped_results, sensitive_functions)
+        
+        return mapped_results
+    
+    def _find_variable_usage(self, var_name: str) -> List[Dict]:
+        """查找变量使用位置"""
+        usages = []
+        
+        for line_num, line in enumerate(self.source_lines, 1):
+            if re.search(rf'\b{var_name}\b', line):
+                usage_type = 'declaration' if any(kw in line for kw in 
+                    ['uint', 'address', 'bool', 'mapping', 'string']) else 'usage'
+                
+                # 改进的操作类型识别
+                operation = self._determine_operation_type(line, var_name)
+                
+                usages.append({
+                    'line': line_num,
+                    'code': line.strip(),
+                    'type': usage_type,
+                    'operation': operation,
+                    'function': self._find_function_for_line(line_num)
+                })
+        
+        return usages
+    
+    def _determine_operation_type(self, line: str, var_name: str) -> str:
+        """
+        准确判断变量操作类型
+        
+        写入操作特征：
+        - varName = value (赋值)
+        - varName += value (复合赋值)
+        - varName++ / ++varName (自增)
+        
+        读取操作特征（不应标记为风险）：
+        - if (varName == ...) (条件判断)
+        - require(varName != ...) (条件检查)
+        - return varName (返回值)
+        - function(varName) (函数参数)
+        """
+        # 移除注释
+        code_part = line.split('//')[0].strip()
+        
+        # 优先级1: 检查写入操作（赋值）- 必须先检查，因为赋值是最明确的写入
+        # 匹配 varName = value 或 varName += value 等
+        # 注意：要排除比较操作 (==, !=, >=, <=)
+        assignment_pattern = rf'\b{re.escape(var_name)}\b\s*(=|[\+\-\*/%&|\^]=|<<=|>>=)\s*'
+        if re.search(assignment_pattern, code_part):
+            # 再次确认不是比较操作 (==, !=, >=, <=)
+            comparison_pattern = rf'\b{re.escape(var_name)}\b\s*(==|!=|>=|<=)\s*'
+            if not re.search(comparison_pattern, code_part):
+                # 确认是赋值操作（写入）
+                return 'write'
+        
+        # 优先级2: 检查自增/自减操作（写入）
+        if re.search(rf'(\+\+{re.escape(var_name)}|{re.escape(var_name)}\+\+|--{re.escape(var_name)}|{re.escape(var_name)}--)', code_part):
+            return 'write'
+        
+        # 优先级3: 检查是否在条件判断中（读取操作）
+        if any(keyword in code_part for keyword in [
+            'if (', 'if(', 
+            'require(', 'require (', 
+            'assert(', 'assert (',
+            'return ', 'return(',
+        ]):
+            # 在条件判断/返回语句中的使用都是读取
+            return 'read'
+        
+        # 优先级4: 检查是否是比较操作（读取操作）
+        # 匹配 varName == / != / > / < / >= / <= 等比较操作
+        comparison_pattern = rf'\b{re.escape(var_name)}\b\s*(==|!=|>|<|>=|<=)\s*'
+        if re.search(comparison_pattern, code_part):
+            return 'read'
+        
+        # 优先级5: 检查函数调用中作为参数（读取）
+        # 例如: someFunction(varName)
+        func_call_pattern = rf'\w+\([^)]*\b{re.escape(var_name)}\b[^)]*\)'
+        if re.search(func_call_pattern, code_part):
+            return 'read'
+        
+        # 优先级6: 检查是否在等号右边（读取操作）
+        # 例如: otherVar = varName + 1
+        if '=' in code_part:
+            parts = code_part.split('=')
+            if len(parts) >= 2:
+                left_side = parts[0]
+                right_side = '='.join(parts[1:])
+                
+                # 变量只在右边出现（读取）
+                if var_name not in left_side and var_name in right_side:
+                    return 'read'
+        
+        # 默认为读取（保守策略，避免误报）
+        return 'read'
+    
+    def _find_function_for_line(self, line_num: int) -> Optional[str]:
+        """找到行所属的函数"""
+        for func_name, func_info in self.function_map.items():
+            if line_num in func_info['lines']:
+                return func_name
+        return None
+    
+    def _check_public_function_has_access_control(self, func_name: str):
+        """
+        检查public函数是否有访问控制（新增功能）
+        
+        返回: (has_control, reason)
+        - has_control: True表示有访问控制，False表示无保护
+        - reason: 说明原因
+        """
+        if not func_name:
+            return False, "未知函数"
+        
+        # 🔧 新增：检查是否是构造函数
+        func_info = self.function_map.get(func_name, {})
+        if func_info.get('is_constructor', False):
+            return True, "构造函数（仅部署时执行一次，安全）"
+        
+        # 🔧 新增：检查是否是modifier
+        if func_info.get('is_modifier', False):
+            return True, "modifier（由其他函数调用，本身不是漏洞点）"
+        
+        # 检查函数定义
+        for line in self.source_lines:
+            # 匹配构造函数（Solidity 0.5.0+）
+            if 'constructor' in line and func_name == 'constructor':
+                return True, "构造函数（仅部署时执行一次，安全）"
+            
+            # 匹配普通函数
+            if f'function {func_name}' in line:
+                # 检查是否是public/external函数
+                if 'public' not in line and 'external' not in line:
+                    return True, "非public函数"
+                
+                # 检查是否有访问控制modifier
+                # 🔧 改进：使用更灵活的模式匹配
+                access_control_patterns = [
+                    'onlyOwner', 'onlyAdmin', 'only', 'ownerOnly',
+                    'isOwner', 'isAdmin', 'is',  # 🔧 新增：isOwner(), isAdmin()等
+                    'whenNotPaused', 'whenPaused',
+                    'nonReentrant', 'senderIsOwner'
+                ]
+                if any(modifier in line for modifier in access_control_patterns):
+                    return True, f"有访问控制modifier"
+        
+        # 检查函数体内是否有访问控制
+        func_lines = self.function_map.get(func_name, {}).get('lines', [])
+        access_control_patterns = ['msg.sender', 'tx.origin', 'owner', 'admin']
+        
+        for func_line_num in func_lines:
+            if 0 <= func_line_num - 1 < len(self.source_lines):
+                line = self.source_lines[func_line_num - 1]
+                
+                if any(keyword in line for keyword in ['require(', 'require ', 'assert(']):
+                    if any(pattern in line for pattern in access_control_patterns):
+                        return True, f"有require访问控制"
+        
+        return False, "public函数无访问控制"
+    
+    def _check_sensitive_functions(self) -> List[Dict]:
+        """
+        🔧 新增：检测敏感函数（selfdestruct, delegatecall等）是否有访问控制
+        
+        返回包含敏感函数位置和风险级别的列表
+        """
+        sensitive_functions = []
+        
+        # 定义敏感函数关键词
+        sensitive_keywords = {
+            'selfdestruct': '合约自毁',
+            'suicide': '合约自毁（已弃用）',
+            'delegatecall': '委托调用（可能改变合约状态）',
+            'callcode': '代码调用（已弃用）',
+        }
+        
+        for line_num, line in enumerate(self.source_lines, 1):
+            for keyword, description in sensitive_keywords.items():
+                if keyword in line.lower():
+                    # 找到敏感函数所在的函数
+                    func_name = self._find_function_for_line(line_num)
+                    
+                    if not func_name:
+                        continue
+                    
+                    # 检查该函数是否有访问控制
+                    has_control, reason = self._check_public_function_has_access_control(func_name)
+                    
+                    sensitive_functions.append({
+                        'line': line_num,
+                        'code': line.strip(),
+                        'keyword': keyword,
+                        'description': description,
+                        'function': func_name,
+                        'has_access_control': has_control,
+                        'control_reason': reason,
+                        'risk_level': 'low' if has_control else 'high'
+                    })
+        
+        return sensitive_functions
+    
+    def _check_source_has_condition(self, usage: Dict) -> bool:
+        """
+        🔧 修复：检查源码位置是否有**任何**条件判断
+        
+        改进思路：
+        - 任何require/assert/if语句都视为有条件保护
+        - 不区分访问控制 vs 状态检查（都是条件）
+        - 让字节码分析和人工审查来判断条件的有效性
+        
+        ✅ 有条件（返回True）：
+        - require(...): 任何require语句
+        - assert(...): 任何assert语句  
+        - if (...): 任何if条件判断
+        - modifier: 任何modifier
+        
+        返回: True表示有条件保护（需人工审查），False表示完全无保护（高危）
+        """
+        line_num = usage['line']
+        func_name = usage.get('function')
+        
+        # 优先级1: 检查函数是否有访问控制modifier
+        if func_name:
+            for line in self.source_lines:
+                if f'function {func_name}' in line:
+                    # 🔧 改进：检查常见的访问控制modifier
+                    access_control_patterns = [
+                        'onlyOwner', 'onlyAdmin', 'only', 'ownerOnly',
+                        'isOwner', 'isAdmin', 'is',  # 🔧 新增：isOwner(), isAdmin()等
+                        'whenNotPaused', 'whenPaused',
+                        'nonReentrant', 'senderIsOwner'
+                    ]
+                    if any(modifier in line for modifier in access_control_patterns):
+                        return True
+        
+        # 🔧 优先级2: 检查函数内是否有**任何**条件判断（不仅限于访问控制）
+        if func_name:
+            func_lines = self.function_map.get(func_name, {}).get('lines', [])
+            if func_lines:
+                for func_line_num in func_lines:
+                    # 只检查当前写入行之前的行（条件保护应该在赋值之前）
+                    if func_line_num >= line_num:
+                        continue
+                    
+                    if 0 <= func_line_num - 1 < len(self.source_lines):
+                        line = self.source_lines[func_line_num - 1]
+                        
+                        # 🔧 关键修复：检查任何require/assert/if语句
+                        if any(keyword in line for keyword in [
+                            'require(', 'require (', 
+                            'assert(', 'assert (',
+                            'revert(', 'revert (',
+                            'if (', 'if(',
+                            'throw', 'throw;'  # Solidity 0.4.x
+                        ]):
+                            return True  # 🔧 有任何条件就返回True
+        
+        # 🔧 优先级3: 检查当前行前几行是否有任何条件
+        # （有些函数可能没有被正确识别，直接检查附近的行）
+        check_range = 10  # 检查前10行
+        
+        for i in range(max(0, line_num - 1 - check_range), line_num - 1):
+            if i < len(self.source_lines):
+                line = self.source_lines[i]
+                
+                # 🔧 检查任何条件语句
+                if any(keyword in line for keyword in [
+                    'require(', 'require (', 
+                    'assert(', 'assert (',
+                    'if (', 'if(',
+                    'throw', 'throw;'
+                ]):
+                    # 🔧 额外验证：不是注释
+                    stripped = line.strip()
+                    if not stripped.startswith('//') and not stripped.startswith('*'):
+                        return True
+        
+        return False
+    
+    def _save_mapped_results(self, results: List[Dict], sensitive_functions: List[Dict] = None):
+        """保存映射结果（包含敏感函数信息）"""
+        output_file = os.path.join(self.output_dir, "intermediate", "source_mapping.json")
+        
+        # 🔧 新增：将敏感函数信息一起保存
+        data_to_save = {
+            'mapped_results': results,
+            'sensitive_functions': sensitive_functions or []
+        }
+        
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump(data_to_save, f, indent=2, ensure_ascii=False)
+        
+        print(f"  → 源码映射结果: {output_file}")
+

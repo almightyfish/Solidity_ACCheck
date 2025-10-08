@@ -1,0 +1,47 @@
+# Python编译文件
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# 分析输出目录
+analysis_output*/
+output/
+results/
+
+# 编译产物
+*.bin
+*.bin-runtime
+*.asm
+*.evm
+
+# 日志文件
+*.log
+
+# IDE配置
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 操作系统文件
+.DS_Store
+Thumbs.db
+
+# 临时文件
+tmp/
+temp/
+*.tmp
+
+# 测试文件
+test_output/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 虚拟环境
+venv/
+env/
+ENV/
+
