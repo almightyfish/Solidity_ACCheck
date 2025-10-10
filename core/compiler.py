@@ -134,13 +134,17 @@ class ContractCompiler:
                 print(f"✓ Combined JSON 已生成")
             
             # 再生成单独的文件（保持兼容性）
+            # 🔧 修复：旧版本solc不支持 --overwrite，需要版本判断
             cmd = [
                 self.solc_path,
                 '--bin', '--bin-runtime', '--asm',
-                '--overwrite',
                 '-o', self.output_dir,
                 contract_path
             ]
+            
+            # 🔧 只在支持的版本上添加 --overwrite（0.4.11+）
+            if self._supports_overwrite():
+                cmd.insert(4, '--overwrite')  # 在 -o 之前插入
             
             print(f"执行命令: {' '.join(cmd)}")
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
@@ -194,6 +198,28 @@ class ContractCompiler:
             print(f"{Colors.RED}❌ 编译错误: {e}{Colors.ENDC}")
             import traceback
             traceback.print_exc()
+            return False
+    
+    def _supports_overwrite(self) -> bool:
+        """🔧 新增：检查solc版本是否支持 --overwrite 选项"""
+        try:
+            # 获取版本号
+            result = subprocess.run([self.solc_path, '--version'], 
+                                  capture_output=True, text=True, timeout=5)
+            version_str = result.stdout
+            
+            # 提取版本号（如 0.4.11+commit.68ef5810）
+            match = re.search(r'Version:\s*(\d+)\.(\d+)\.(\d+)', version_str)
+            if match:
+                major, minor, patch = int(match.group(1)), int(match.group(2)), int(match.group(3))
+                
+                # --overwrite 在 0.4.11+ 版本开始支持
+                if major > 0 or (major == 0 and minor > 4) or (major == 0 and minor == 4 and patch >= 11):
+                    return True
+            
+            return False
+        except:
+            # 如果无法判断版本，保守起见不使用 --overwrite
             return False
     
     def _extract_contract_name(self, contract_path: str) -> str:

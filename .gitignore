@@ -45,3 +45,6 @@ venv/
 env/
 ENV/
 
+.analysis_summary.csv
+.analysis_summary.json
+

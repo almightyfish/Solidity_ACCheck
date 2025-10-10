@@ -168,11 +168,24 @@ class ReportGenerator:
                     
                     print(f"       {Colors.RED}⛔ 行 {risk['line']:3d} ({func_name}): {risk['code']}{Colors.ENDC}")
                     
-                    # 显示检测方法
+                    # 🔧 增强：显示详细的检测信息
                     if detection_method == 'public_function_check':
                         print(f"          {Colors.YELLOW}🔍 检测方式: 补充检测（public函数无访问控制）{Colors.ENDC}")
                     else:
-                        print(f"          🔍 检测方式: 污点分析")
+                        print(f"          🔍 检测方式: 污点分析（增强版CFG）")
+                    
+                    # 🔧 新增：显示字节码和源码检测结果
+                    has_bytecode_cond = risk.get('has_bytecode_condition', False)
+                    has_source_cond = risk.get('has_source_condition', False)
+                    bytecode_types = risk.get('bytecode_condition_types', [])
+                    confidence = risk.get('protection_confidence', 'unknown')
+                    
+                    print(f"          📊 双重检测结果:")
+                    print(f"             • 字节码层面: {'✓ 有条件' if has_bytecode_cond else '✗ 无条件'}")
+                    if bytecode_types:
+                        print(f"               类型: {', '.join(bytecode_types)}")
+                    print(f"             • 源码层面: {'✓ 有条件' if has_source_cond else '✗ 无条件'}")
+                    print(f"             • 置信度: {confidence}")
                     
                     # 显示警告信息
                     if warning:
@@ -190,12 +203,31 @@ class ReportGenerator:
                 print(f"\n    {Colors.YELLOW}⚠️  可疑位置（检测到条件判断，建议人工审查）:{Colors.ENDC}")
                 for risk in result['suspicious_locations']:
                     func_name = risk['function'] or '未知函数'
-                    has_condition = risk.get('has_source_condition', False)
-                    condition_mark = " ✓" if has_condition else ""
+                    has_bytecode_cond = risk.get('has_bytecode_condition', False)
+                    has_source_cond = risk.get('has_source_condition', False)
+                    bytecode_types = risk.get('bytecode_condition_types', [])
+                    confidence = risk.get('protection_confidence', 'unknown')
+                    
+                    condition_mark = " ✓" if (has_bytecode_cond or has_source_cond) else ""
                     print(f"       {Colors.YELLOW}⚡ 行 {risk['line']:3d} ({func_name}): {risk['code']}{condition_mark}{Colors.ENDC}")
                     
-                    if has_condition:
-                        print(f"          {Colors.GREEN}↳ 检测到条件保护（require/if/modifier）{Colors.ENDC}")
+                    # 🔧 增强：显示详细检测结果
+                    print(f"          📊 双重检测结果:")
+                    print(f"             • 字节码层面: {'✓ 有条件' if has_bytecode_cond else '✗ 无条件'}")
+                    if bytecode_types:
+                        condition_desc = {
+                            'access_control': '访问控制（CALLER+比较）',
+                            'conditional_jump': '条件跳转（JUMPI）',
+                            'comparison': '比较操作',
+                            'revert': '回滚保护（REVERT）'
+                        }
+                        types_str = ', '.join([condition_desc.get(t, t) for t in bytecode_types])
+                        print(f"               类型: {types_str}")
+                    print(f"             • 源码层面: {'✓ 有条件' if has_source_cond else '✗ 无条件'}")
+                    print(f"             • 保护强度: {confidence}")
+                    
+                    if has_bytecode_cond or has_source_cond:
+                        print(f"          {Colors.GREEN}↳ 检测到条件保护，但需人工验证是否充分{Colors.ENDC}")
                     
                     # 上下文
                     line_idx = risk['line'] - 1

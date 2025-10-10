@@ -279,6 +279,10 @@ class SourceMapper:
         print(f"\n{Colors.HEADER}【步骤5】源码映射{Colors.ENDC}")
         print("-" * 80)
         
+        # 🔧 保存字节码分析器的指令信息（用于敏感函数映射）
+        if hasattr(bytecode_analyzer, 'instructions'):
+            self.instructions = bytecode_analyzer.instructions
+        
         mapped_results = []
         
         for taint_result in taint_results:
@@ -337,27 +341,49 @@ class SourceMapper:
                                 # 例如：function getPet(...) view returns (uint256 genes) { genes = pet.genes; }
                                 continue
                         
-                        # 🔧 新方法：利用字节码分析的路径条件信息
+                        # 🔧 新方法：利用字节码分析的路径条件信息（增强版）
                         # 检查是否所有包含此写入的污点路径都有条件判断
                         has_path_condition = False
                         has_path_without_condition = False
+                        bytecode_condition_types = []  # 🔧 新增：记录字节码发现的条件类型
+                        bytecode_condition_details = []  # 🔧 新增：详细的条件信息
                         
                         if 'paths_with_conditions' in taint_result:
                             for path_info in taint_result['paths_with_conditions']:
                                 if path_info['has_condition']:
                                     has_path_condition = True
+                                    # 🔧 新增：收集条件类型
+                                    if 'condition_types' in path_info:
+                                        bytecode_condition_types.extend(path_info['condition_types'])
+                                        bytecode_condition_details.append({
+                                            'types': path_info['condition_types'],
+                                            'count': path_info.get('condition_count', 0)
+                                        })
                                 else:
                                     has_path_without_condition = True
+                        
+                        # 去重条件类型
+                        bytecode_condition_types = list(set(bytecode_condition_types))
                         
                         # 同时检查源码级别的访问控制（作为补充）
                         has_source_condition = self._check_source_has_condition(usage)
                         
-                        # 综合判断：字节码条件 + 源码访问控制
+                        # 🔧 改进：综合判断（双重验证机制）
                         has_protection = has_path_condition or has_source_condition
                         
+                        # 🔧 新增：置信度评估
+                        confidence = self._calculate_confidence(
+                            has_path_condition, 
+                            has_source_condition,
+                            bytecode_condition_types
+                        )
+                        
                         location_info = usage.copy()
-                        location_info['has_bytecode_condition'] = has_path_condition  # 🆕 字节码层面的条件
+                        location_info['has_bytecode_condition'] = has_path_condition  # 字节码层面的条件
                         location_info['has_source_condition'] = has_source_condition  # 源码层面的条件
+                        location_info['bytecode_condition_types'] = bytecode_condition_types  # 🔧 新增
+                        location_info['bytecode_condition_details'] = bytecode_condition_details  # 🔧 新增
+                        location_info['protection_confidence'] = confidence  # 🔧 新增：保护强度置信度
                         location_info['detection_method'] = 'taint_analysis'
                         
                         # 🔧 改进后的逻辑：
@@ -446,17 +472,42 @@ class SourceMapper:
             
             mapped_results.append(mapped)
         
-        # 🔧 新增：检测敏感函数
-        print(f"\n{Colors.HEADER}【额外检测】敏感函数分析{Colors.ENDC}")
+        # 🔧 改进：检测敏感函数（双重检测：字节码 + 源码）
+        print(f"\n{Colors.HEADER}【额外检测】敏感函数分析（双重检测）{Colors.ENDC}")
         print("-" * 80)
-        sensitive_functions = self._check_sensitive_functions()
+        
+        # 1️⃣ 字节码层面检测
+        bytecode_sensitive = []
+        if hasattr(bytecode_analyzer, 'sensitive_operations'):
+            bytecode_sensitive = bytecode_analyzer.sensitive_operations
+            if bytecode_sensitive:
+                print(f"🔍 字节码检测: 发现 {len(bytecode_sensitive)} 个敏感操作")
+        
+        # 2️⃣ 源码层面检测
+        source_sensitive = self._check_sensitive_functions()
+        if source_sensitive:
+            print(f"🔍 源码检测: 发现 {len(source_sensitive)} 个敏感函数调用")
+        
+        # 3️⃣ 综合结果（双重验证）
+        sensitive_functions = self._merge_sensitive_detections(
+            bytecode_sensitive, 
+            source_sensitive
+        )
         
         if sensitive_functions:
-            print(f"{Colors.YELLOW}⚠️  发现 {len(sensitive_functions)} 个敏感函数调用{Colors.ENDC}")
+            print(f"\n{Colors.YELLOW}⚠️  综合结果: {len(sensitive_functions)} 个敏感操作{Colors.ENDC}")
             for sf in sensitive_functions:
                 risk_color = Colors.GREEN if sf['has_access_control'] else Colors.RED
                 risk_icon = "✅" if sf['has_access_control'] else "❌"
+                detection_source = sf.get('detection_source', 'source')
+                detection_badge = {
+                    'both': '🔴🔵 双重检测',
+                    'bytecode': '🔴 字节码',
+                    'source': '🔵 源码'
+                }.get(detection_source, detection_source)
+                
                 print(f"  {risk_icon} 行 {sf['line']:4d}: {sf['keyword']} - {sf['description']}")
+                print(f"     检测来源: {detection_badge}")
                 print(f"     函数: {sf['function']}, 访问控制: {sf['control_reason']}")
         else:
             print(f"{Colors.GREEN}✓ 未发现敏感函数调用{Colors.ENDC}")
@@ -651,7 +702,7 @@ class SourceMapper:
     
     def _check_sensitive_functions(self) -> List[Dict]:
         """
-        🔧 新增：检测敏感函数（selfdestruct, delegatecall等）是否有访问控制
+        🔧 源码层面：检测敏感函数（selfdestruct, delegatecall等）是否有访问控制
         
         返回包含敏感函数位置和风险级别的列表
         """
@@ -666,8 +717,17 @@ class SourceMapper:
         }
         
         for line_num, line in enumerate(self.source_lines, 1):
+            # 🔧 改进：跳过注释行（减少误报）
+            stripped = line.strip()
+            if stripped.startswith('//') or stripped.startswith('*') or stripped.startswith('/*'):
+                continue
+            
             for keyword, description in sensitive_keywords.items():
                 if keyword in line.lower():
+                    # 🔧 改进：检查是否在字符串中（简单检测）
+                    if line.count('"') >= 2 and keyword in line.split('"')[1::2]:
+                        continue  # 在字符串字面量中，跳过
+                    
                     # 找到敏感函数所在的函数
                     func_name = self._find_function_for_line(line_num)
                     
@@ -685,10 +745,103 @@ class SourceMapper:
                         'function': func_name,
                         'has_access_control': has_control,
                         'control_reason': reason,
-                        'risk_level': 'low' if has_control else 'high'
+                        'risk_level': 'low' if has_control else 'high',
+                        'detection_source': 'source'  # 🔧 新增：标记来源
                     })
         
         return sensitive_functions
+    
+    def _merge_sensitive_detections(self, bytecode_ops: List[Dict], 
+                                   source_funcs: List[Dict]) -> List[Dict]:
+        """
+        🔧 新增：合并字节码和源码的敏感函数检测结果
+        
+        策略：
+        1. 字节码检测到但源码没检测到 → 使用字节码结果（可能源码被混淆）
+        2. 源码检测到但字节码没检测到 → 使用源码结果（可能是条件调用）
+        3. 两者都检测到 → 合并信息，标记为双重验证
+        
+        Args:
+            bytecode_ops: 字节码层面检测的敏感操作
+            source_funcs: 源码层面检测的敏感函数
+        
+        Returns:
+            合并后的敏感函数列表
+        """
+        merged = []
+        
+        # 🔧 新增：使用srcmap将字节码操作映射到源码行
+        bytecode_mapped = []
+        if self.srcmap_entries and bytecode_ops:
+            for op in bytecode_ops:
+                # 尝试找到对应的源码位置
+                # 简化版：通过基本块找到大致位置
+                line = self._estimate_line_for_bytecode_op(op)
+                if line:
+                    bytecode_mapped.append({
+                        'line': line,
+                        'code': self.source_lines[line - 1].strip() if line <= len(self.source_lines) else '',
+                        'keyword': op['opcode'].lower(),
+                        'description': op['description'],
+                        'function': self._find_function_for_line(line),
+                        'has_access_control': False,  # 默认假设无保护，后续检查
+                        'control_reason': '需要源码验证',
+                        'risk_level': op['severity'],
+                        'detection_source': 'bytecode'
+                    })
+        
+        # 合并策略：基于行号匹配
+        source_lines_set = {sf['line'] for sf in source_funcs}
+        bytecode_lines_set = {bf['line'] for bf in bytecode_mapped}
+        
+        # 1. 源码检测到的（包括双重检测的）
+        for sf in source_funcs:
+            # 检查是否也被字节码检测到（双重验证）
+            if sf['line'] in bytecode_lines_set:
+                sf_copy = sf.copy()
+                sf_copy['detection_source'] = 'both'  # 双重验证
+                merged.append(sf_copy)
+            else:
+                merged.append(sf)
+        
+        # 2. 仅字节码检测到的（源码可能被混淆或优化）
+        for bf in bytecode_mapped:
+            if bf['line'] not in source_lines_set:
+                # 检查访问控制（通过源码）
+                if bf['function']:
+                    has_control, reason = self._check_public_function_has_access_control(bf['function'])
+                    bf['has_access_control'] = has_control
+                    bf['control_reason'] = reason
+                    bf['risk_level'] = 'low' if has_control else bf['risk_level']
+                merged.append(bf)
+        
+        return merged
+    
+    def _estimate_line_for_bytecode_op(self, bytecode_op: Dict) -> Optional[int]:
+        """
+        🔧 新增：估算字节码操作对应的源码行号
+        
+        通过srcmap或基本块位置估算
+        """
+        if not self.srcmap_entries:
+            return None
+        
+        offset = bytecode_op['offset']
+        
+        # 方法1：直接通过srcmap条目查找
+        for idx, instr in enumerate(self.instructions if hasattr(self, 'instructions') else []):
+            if instr.get('offset') == offset and idx < len(self.srcmap_entries):
+                return self.srcmap_entries[idx]['line']
+        
+        # 方法2：通过基本块查找（如果有）
+        bb_start = bytecode_op.get('basic_block', -1)
+        if bb_start >= 0:
+            # 查找该基本块的第一条指令对应的源码行
+            for idx, instr in enumerate(self.instructions if hasattr(self, 'instructions') else []):
+                if instr.get('offset') >= bb_start and idx < len(self.srcmap_entries):
+                    return self.srcmap_entries[idx]['line']
+        
+        return None
     
     def _check_source_has_condition(self, usage: Dict) -> bool:
         """
@@ -767,6 +920,51 @@ class SourceMapper:
                         return True
         
         return False
+    
+    def _calculate_confidence(self, has_bytecode_condition: bool, has_source_condition: bool, 
+                             bytecode_condition_types: List[str]) -> str:
+        """
+        🔧 新增：计算保护强度的置信度
+        
+        置信度级别：
+        - high: 字节码和源码都检测到条件，且包含访问控制
+        - medium: 只有一方检测到，或者没有明确的访问控制
+        - low: 两者都没检测到
+        
+        Args:
+            has_bytecode_condition: 字节码是否检测到条件
+            has_source_condition: 源码是否检测到条件
+            bytecode_condition_types: 字节码检测到的条件类型列表
+        
+        Returns:
+            'high', 'medium', 或 'low'
+        """
+        # 完全没有保护
+        if not has_bytecode_condition and not has_source_condition:
+            return 'low'
+        
+        # 双重验证：字节码和源码都检测到
+        if has_bytecode_condition and has_source_condition:
+            # 进一步检查：是否包含访问控制
+            if 'access_control' in bytecode_condition_types:
+                return 'high'  # 有明确的访问控制
+            else:
+                return 'medium'  # 有条件但不确定是否是访问控制
+        
+        # 单一验证：只有一方检测到
+        if has_bytecode_condition:
+            # 字节码检测到，检查条件类型
+            if 'access_control' in bytecode_condition_types:
+                return 'medium'  # 有访问控制特征
+            elif 'revert' in bytecode_condition_types:
+                return 'medium'  # 有回滚保护
+            else:
+                return 'low'  # 只有简单条件
+        
+        if has_source_condition:
+            return 'medium'  # 源码检测到modifier或require
+        
+        return 'low'
     
     def _save_mapped_results(self, results: List[Dict], sensitive_functions: List[Dict] = None):
         """保存映射结果（包含敏感函数信息）"""

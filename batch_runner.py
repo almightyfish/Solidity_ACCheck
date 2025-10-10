@@ -69,6 +69,8 @@ def extract_critical_vars_from_llm(raw_text: str):
 
 def main():
     skipped_files = []
+    failed_files = []  # 🔧 新增：记录编译/分析失败的文件
+    success_files = []  # 🔧 新增：记录成功的文件
 
     with open(JSONL_PATH, "r", encoding="utf-8") as f:
         for line_num, line in enumerate(f, 1):
@@ -121,15 +123,51 @@ def main():
                 result = analyzer.run()
                 if result:
                     print(f"✅ {filename} 分析成功！")
+                    success_files.append(filename)  # 🔧 记录成功
                 else:
                     print(f"❌ {filename} 分析失败！")
+                    failed_files.append({
+                        'filename': filename,
+                        'reason': '分析失败（run返回False）',
+                        'solc_version': solc_version
+                    })  # 🔧 记录失败
             except Exception as e:
                 print(f"💥 分析 {filename} 时出错: {e}")
+                failed_files.append({
+                    'filename': filename,
+                    'reason': f'异常: {str(e)}',
+                    'solc_version': solc_version
+                })  # 🔧 记录异常
 
+    # 🔧 新增：打印统计信息
+    print("\n" + "="*80)
+    print("📊 批量分析统计")
+    print("="*80)
+    print(f"✅ 成功: {len(success_files)} 个")
+    print(f"❌ 失败: {len(failed_files)} 个")
+    print(f"⏭️ 跳过: {len(skipped_files)} 个")
+    print(f"📈 成功率: {len(success_files) / (len(success_files) + len(failed_files)) * 100:.1f}%" if (len(success_files) + len(failed_files)) > 0 else "N/A")
+    
     if skipped_files:
         print("\n⏭️ 以下文件被跳过（无 Solidity 版本声明）：")
         for name in skipped_files:
             print(f" - {name}")
+    
+    # 🔧 新增：详细打印失败的文件
+    if failed_files:
+        print("\n" + "="*80)
+        print(f"❌ 编译/分析失败的文件（共 {len(failed_files)} 个）")
+        print("="*80)
+        
+        for i, item in enumerate(failed_files, 1):
+            print(f"\n{i}. {item['filename']}")
+            print(f"   Solc版本: {item['solc_version']}")
+            print(f"   失败原因: {item['reason']}")
+        
+        print("\n💡 建议：")
+        print("  1. 检查是否是pragma版本与实际语法不匹配")
+        print("  2. 尝试使用稳定版本（0.4.18, 0.5.16等）")
+        print("  3. 查看具体的编译错误信息")
 
     print("\n🎯 所有任务完成！")
 
