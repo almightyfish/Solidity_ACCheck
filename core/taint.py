@@ -47,11 +47,12 @@ class TaintAnalyzer:
         for var, info in var_storage_map.items():
             slot = info.get('slot')
             
-            # 找到操作该slot的SSTORE/SLOAD
+            # 找到操作该slot的SSTORE（只检查写入操作，不检查读取）
+            # 🔧 修复：SLOAD只是读取，不会修改变量，不应作为污点汇
             sink_bbs = set()
             for b in bb:
                 for idx, instr in enumerate(b['instructions']):
-                    if instr['op'] in ('SSTORE', 'SLOAD'):
+                    if instr['op'] == 'SSTORE':  # 只检查写入操作
                         if self._find_slot_in_stack(b['instructions'], idx, slot):
                             sink_bbs.add(b['start'])
             

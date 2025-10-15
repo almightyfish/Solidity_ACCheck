@@ -14,7 +14,7 @@ from core.analyzer import AllInOneAnalyzer
 JSONL_PATH = "/Users/almightyfish/Desktop/AChecker/AC/solidity_analysis_deepseek_with_llm_longtail.jsonl"
 
 # 输出目录根路径
-OUTPUT_ROOT = "analysis_output"
+OUTPUT_ROOT = "analysis_output_2"
 
 # Solidity 版本匹配正则
 PRAGMA_PATTERN = re.compile(r"pragma\s+solidity\s+(\^?\d+\.\d+\.\d+)", re.IGNORECASE)

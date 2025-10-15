@@ -898,14 +898,21 @@ class SourceMapper:
                             'throw', 'throw;'  # Solidity 0.4.x
                         ]):
                             return True  # 🔧 有任何条件就返回True
+                
+                # ✅ 如果函数已识别，优先使用函数内检测，直接返回False（无条件）
+                return False
         
-        # 🔧 优先级3: 检查当前行前几行是否有任何条件
-        # （有些函数可能没有被正确识别，直接检查附近的行）
-        check_range = 10  # 检查前10行
+        # 🔧 优先级3: 仅当函数未识别时，检查当前行前几行（限定范围，避免跨函数）
+        # ⚠️ 重要：只检查同一作用域内的行，避免误把其他函数的条件当成保护
+        check_range = 5  # 🔧 缩小范围到5行（从10改为5）
         
         for i in range(max(0, line_num - 1 - check_range), line_num - 1):
             if i < len(self.source_lines):
                 line = self.source_lines[i]
+                
+                # 🔧 跳过函数声明行（避免跨函数检测）
+                if 'function ' in line or '}' in line.strip():
+                    continue
                 
                 # 🔧 检查任何条件语句
                 if any(keyword in line for keyword in [
