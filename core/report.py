@@ -9,7 +9,7 @@ import os
 from datetime import datetime
 from typing import List, Dict
 from utils.colors import Colors
-
+import re
 
 class ReportGenerator:
     """报告生成器"""
@@ -27,22 +27,24 @@ class ReportGenerator:
         print(f"\n{Colors.HEADER}【步骤6】生成报告{Colors.ENDC}")
         print("=" * 80)
         
-        # 🔧 新增：读取敏感函数信息
+        # 🔧 新增：读取敏感函数信息和污点流信息
         sensitive_functions = []
+        taint_to_sensitive_flows = []
         source_mapping_path = os.path.join(self.output_dir, "intermediate", "source_mapping.json")
         try:
             with open(source_mapping_path, 'r', encoding='utf-8') as f:
                 source_mapping_data = json.load(f)
                 if isinstance(source_mapping_data, dict):
                     sensitive_functions = source_mapping_data.get('sensitive_functions', [])
+                    taint_to_sensitive_flows = source_mapping_data.get('taint_to_sensitive_flows', [])
         except:
             pass
         
         # 使用 has_vulnerability 而不是只看 has_taint
         vulnerable_count = sum(1 for r in mapped_results if r.get('has_vulnerability', r['has_taint']))
         
-        # 终端报告（包含敏感函数）
-        self._print_terminal_report(mapped_results, vulnerable_count, sensitive_functions)
+        # 终端报告（包含敏感函数和污点流）
+        self._print_terminal_report(mapped_results, vulnerable_count, sensitive_functions, taint_to_sensitive_flows)
         
         # JSON报告
         report = {
@@ -53,10 +55,13 @@ class ReportGenerator:
                 'vulnerable_variables': vulnerable_count,
                 'safe_variables': len(mapped_results) - vulnerable_count,
                 'sensitive_functions_count': len(sensitive_functions),  # 🔧 新增
-                'high_risk_sensitive_functions': sum(1 for sf in sensitive_functions if sf['risk_level'] == 'high')
+                'high_risk_sensitive_functions': sum(1 for sf in sensitive_functions if sf['risk_level'] == 'high'),
+                'taint_to_sensitive_flows': len(taint_to_sensitive_flows),  # 🔧 新增
+                'critical_flows': len([f for f in taint_to_sensitive_flows if f.get('risk_level') == 'critical'])
             },
             'results': mapped_results,
-            'sensitive_functions': sensitive_functions  # 🔧 新增：敏感函数检测结果
+            'sensitive_functions': sensitive_functions,  # 🔧 新增：敏感函数检测结果
+            'taint_to_sensitive_flows': taint_to_sensitive_flows  # 🔧 新增：污点到敏感函数的流
         }
         
         # 保存最终报告
@@ -72,10 +77,17 @@ class ReportGenerator:
         self._generate_html_report(report, html_report_path)
         print(f"   {html_report_path}")
         
+        # 🔧 新增：生成LLM漏洞报告（JSONL格式）
+        llm_report_path = os.path.join(self.output_dir, "llm_vulnerability_report.jsonl")
+        self._generate_llm_report(mapped_results, llm_report_path)
+        print(f"   {llm_report_path} (LLM修复输入)")
+        
         return report
     
-    def _print_terminal_report(self, results: List[Dict], vulnerable_count: int, sensitive_functions: List[Dict] = None):
-        """打印终端报告（包含敏感函数）"""
+    def _print_terminal_report(self, results: List[Dict], vulnerable_count: int, 
+                              sensitive_functions: List[Dict] = None,
+                              taint_to_sensitive_flows: List[Dict] = None):
+        """打印终端报告（包含敏感函数和污点流）"""
         print(f"\n{Colors.BOLD}分析概要:{Colors.ENDC}")
         print(f"  总变量数: {len(results)}")
         print(f"  检测到漏洞: {Colors.RED}{vulnerable_count}{Colors.ENDC}")
@@ -88,6 +100,11 @@ class ReportGenerator:
                 print(f"  {Colors.RED}⚠️  高风险敏感函数: {high_risk_count}{Colors.ENDC}")
             else:
                 print(f"  {Colors.GREEN}✓ 敏感函数: {len(sensitive_functions)} (已有访问控制){Colors.ENDC}")
+        
+        # 🔧 新增：污点到敏感函数流概要
+        if taint_to_sensitive_flows:
+            critical_count = len([f for f in taint_to_sensitive_flows if f.get('risk_level') == 'critical'])
+            print(f"  {Colors.RED}🔥 严重: 污点到敏感函数的流: {critical_count} 条{Colors.ENDC}")
         
         print(f"\n{Colors.BOLD}详细结果:{Colors.ENDC}")
         print("=" * 80)
@@ -404,4 +421,474 @@ class ReportGenerator:
         
         with open(output_path, 'w', encoding='utf-8') as f:
             f.write(html_content)
+    
+    def _generate_llm_report(self, mapped_results: List[Dict], output_path: str):
+        """
+        🔧 新增：生成面向LLM的漏洞报告（JSONL格式）
+        
+        每行一个JSON对象，包含：
+        - 合约基本信息
+        - 漏洞位置和代码
+        - 完整函数代码
+        - 上下文信息
+        - 漏洞描述和数据流
+        - 相关声明
+        
+        Args:
+            mapped_results: 源码映射后的分析结果
+            output_path: 输出文件路径
+        """
+        import re
+        from pathlib import Path
+        
+        # 提取合约名称
+        contract_name = self._extract_contract_name()
+        
+        # 读取源码映射器的函数信息（如果有）
+        function_map = self._load_function_map()
+        
+        vulnerabilities = []
+        vuln_id_counter = 1
+        
+        for result in mapped_results:
+            variable = result['variable']
+            var_slot = result['storage_slot']
+            
+            # 查找变量声明
+            var_declaration = self._find_variable_declaration(variable)
+            var_type = self._extract_variable_type(var_declaration) if var_declaration else 'unknown'
+            
+            # 处理危险路径（critical）
+            for dangerous_loc in result.get('dangerous_locations', []):
+                vuln = self._create_llm_vulnerability_entry(
+                    vuln_id=f"vuln_{vuln_id_counter:03d}",
+                    contract_name=contract_name,
+                    severity='critical',
+                    vuln_type='dangerous_path',
+                    variable=variable,
+                    var_type=var_type,
+                    var_slot=var_slot,
+                    location=dangerous_loc,
+                    function_map=function_map,
+                    var_declaration=var_declaration
+                )
+                vulnerabilities.append(vuln)
+                vuln_id_counter += 1
+            
+            # 处理可疑路径（suspicious）
+            for suspicious_loc in result.get('suspicious_locations', []):
+                vuln = self._create_llm_vulnerability_entry(
+                    vuln_id=f"vuln_{vuln_id_counter:03d}",
+                    contract_name=contract_name,
+                    severity='suspicious',
+                    vuln_type='suspicious_path',
+                    variable=variable,
+                    var_type=var_type,
+                    var_slot=var_slot,
+                    location=suspicious_loc,
+                    function_map=function_map,
+                    var_declaration=var_declaration
+                )
+                vulnerabilities.append(vuln)
+                vuln_id_counter += 1
+        
+        # 写入JSONL文件（每行一个JSON）
+        with open(output_path, 'w', encoding='utf-8') as f:
+            for vuln in vulnerabilities:
+                f.write(json.dumps(vuln, ensure_ascii=False) + '\n')
+    
+    def _create_llm_vulnerability_entry(self, vuln_id: str, contract_name: str,
+                                       severity: str, vuln_type: str,
+                                       variable: str, var_type: str, var_slot: int,
+                                       location: Dict, function_map: Dict,
+                                       var_declaration: Dict) -> Dict:
+        """
+        创建单个LLM漏洞条目
+        
+        Args:
+            vuln_id: 漏洞ID
+            contract_name: 合约名称
+            severity: 严重程度（critical/suspicious）
+            vuln_type: 漏洞类型（dangerous_path/suspicious_path）
+            variable: 变量名
+            var_type: 变量类型
+            var_slot: 存储槽位
+            location: 漏洞位置信息
+            function_map: 函数映射表
+            var_declaration: 变量声明信息
+        
+        Returns:
+            LLM友好的漏洞信息字典
+        """
+        line = location['line']
+        func_name = location.get('function', 'unknown')
+        code = location['code']
+        
+        # 获取完整函数代码
+        function_full_code = self._get_function_full_code(func_name, function_map)
+        function_signature = self._extract_function_signature(func_name)
+        
+        # 获取上下文（前后3行）
+        context_before, context_after = self._get_context_lines(line, context_size=3)
+        
+        # 生成描述
+        description = self._generate_vulnerability_description(
+            variable, severity, vuln_type, location
+        )
+        
+        # 生成攻击场景描述
+        attack_scenario = self._generate_attack_scenario(variable, func_name, severity)
+        
+        # 提取数据流摘要
+        data_flow = self._extract_data_flow_summary(location, variable, var_slot)
+        
+        # 提取已有的检查
+        existing_checks = []
+        missing_checks = []
+        if location.get('has_source_condition'):
+            existing_checks = self._extract_existing_checks(func_name, function_map)
+        if severity == 'critical':
+            missing_checks = ['调用者身份验证', '访问控制检查']
+        elif not location.get('has_bytecode_condition') and not location.get('has_source_condition'):
+            missing_checks = ['任何形式的条件保护']
+        
+        # 构建基础漏洞条目
+        vuln_entry = {
+            # 基本信息
+            'contract_file': self.source_file,
+            'contract_name': contract_name,
+            'vulnerability_id': vuln_id,
+            'severity': severity,
+            
+            # 变量信息
+            'variable': variable,
+            'variable_type': var_type,
+            'variable_slot': var_slot,
+            
+            # 位置信息
+            'line': line,
+            'function': func_name,
+            'function_signature': function_signature,
+            'vulnerable_code': code.strip(),
+            
+            # 代码上下文
+            'function_full_code': function_full_code,
+            'context_before': context_before,
+            'context_after': context_after,
+            
+            # 漏洞详情
+            'vulnerability_type': vuln_type,
+            'description': description,
+            'attack_scenario': attack_scenario,
+            
+            # 保护检测
+            'has_condition_protection': location.get('has_bytecode_condition', False) or location.get('has_source_condition', False),
+            'has_modifier': self._check_has_modifier(function_signature),
+            'has_require_check': location.get('has_source_condition', False),
+            
+            # 分析详情
+            'detection_confidence': self._determine_confidence(location),
+            'detection_method': location.get('detection_method', 'taint_analysis'),
+            'data_flow': data_flow,
+            
+            # 相关代码
+            'related_declarations': {
+                'variable_declaration': var_declaration.get('code', '') if var_declaration else '',
+                'variable_init_location': var_declaration.get('init_location', None) if var_declaration else None,
+                'variable_init_code': var_declaration.get('init_code', None) if var_declaration else None
+            }
+        }
+        
+        # 添加可选字段
+        if existing_checks:
+            vuln_entry['existing_checks'] = existing_checks
+        
+        if missing_checks:
+            vuln_entry['missing_checks'] = missing_checks
+        
+        # 对于可疑路径，添加人工审查提示
+        if severity == 'suspicious':
+            vuln_entry['human_review_notes'] = self._generate_review_notes(variable, func_name)
+        
+        # 添加字节码条件类型（如果有）
+        if 'bytecode_condition_types' in location:
+            vuln_entry['bytecode_condition_types'] = location['bytecode_condition_types']
+        
+        return vuln_entry
+    
+    def _extract_contract_name(self) -> str:
+        """提取合约名称"""
+        for line in self.source_lines:
+            if 'contract ' in line and 'interface' not in line:
+                match = re.search(r'\bcontract\s+(\w+)', line)
+                if match:
+                    return match.group(1)
+        return Path(self.source_file).stem
+    
+    def _load_function_map(self) -> Dict:
+        """加载函数映射表（从source_mapper获取）"""
+        # 尝试从source_mapping.json读取
+        try:
+            source_mapping_path = os.path.join(self.output_dir, "intermediate", "source_mapping.json")
+            with open(source_mapping_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                # 如果有function_map，返回它
+                if 'function_map' in data:
+                    return data['function_map']
+        except:
+            pass
+        
+        # 否则，简单解析源码
+        return self._parse_functions_from_source()
+    
+    def _parse_functions_from_source(self) -> Dict:
+        """从源码解析函数信息（简化版）"""
+        import re
+        function_map = {}
+        
+        for i, line in enumerate(self.source_lines, 1):
+            # 匹配函数定义
+            match = re.search(r'function\s+(\w+)\s*\([^)]*\)', line)
+            if match:
+                func_name = match.group(1)
+                # 找到函数结束位置（简化：找到下一个大括号闭合）
+                end_line = self._find_function_end(i)
+                function_map[func_name] = {
+                    'start_line': i,
+                    'end_line': end_line,
+                    'signature': line.strip()
+                }
+            
+            # 构造函数
+            if 'constructor' in line and '(' in line:
+                end_line = self._find_function_end(i)
+                function_map['constructor'] = {
+                    'start_line': i,
+                    'end_line': end_line,
+                    'signature': line.strip()
+                }
+        
+        return function_map
+    
+    def _find_function_end(self, start_line: int) -> int:
+        """找到函数结束行（简化版：大括号计数）"""
+        brace_count = 0
+        found_opening = False
+        
+        for i in range(start_line - 1, len(self.source_lines)):
+            line = self.source_lines[i]
+            if '{' in line:
+                found_opening = True
+            brace_count += line.count('{') - line.count('}')
+            
+            if found_opening and brace_count == 0 and '}' in line:
+                return i + 1
+        
+        return start_line + 10  # 默认10行
+    
+    def _find_variable_declaration(self, variable: str) -> Dict:
+        """查找变量声明"""
+        import re
+        for i, line in enumerate(self.source_lines, 1):
+            # 匹配变量声明（如：address public owner;）
+            if re.search(rf'\b{re.escape(variable)}\b', line):
+                # 检查是否是声明行
+                if any(kw in line for kw in ['uint', 'address', 'bool', 'mapping', 'string', 'bytes']):
+                    # 查找初始化位置
+                    init_location, init_code = self._find_variable_initialization(variable)
+                    return {
+                        'line': i,
+                        'code': line.strip(),
+                        'init_location': init_location,
+                        'init_code': init_code
+                    }
+        return {}
+    
+    def _find_variable_initialization(self, variable: str):
+        """查找变量初始化位置"""
+        import re
+        for i, line in enumerate(self.source_lines, 1):
+            # 匹配赋值（如：owner = msg.sender;）
+            if re.search(rf'\b{re.escape(variable)}\s*=\s*', line):
+                # 判断是否在构造函数中
+                if self._is_in_constructor(i):
+                    return 'constructor', line.strip()
+                else:
+                    func = self._find_function_at_line(i)
+                    return func if func else 'unknown', line.strip()
+        return None, None
+    
+    def _is_in_constructor(self, line_num: int) -> bool:
+        """判断行是否在构造函数中"""
+        # 向前查找构造函数定义
+        for i in range(line_num - 1, max(0, line_num - 20), -1):
+            line = self.source_lines[i]
+            if 'constructor' in line:
+                return True
+            if 'function ' in line:
+                return False
+        return False
+    
+    def _find_function_at_line(self, line_num: int) -> str:
+        """查找指定行所在的函数"""
+        import re
+        # 向前查找函数定义
+        for i in range(line_num - 1, max(0, line_num - 50), -1):
+            line = self.source_lines[i]
+            match = re.search(r'function\s+(\w+)', line)
+            if match:
+                return match.group(1)
+        return None
+    
+    def _extract_variable_type(self, var_declaration: Dict) -> str:
+        """从声明中提取变量类型"""
+        if not var_declaration:
+            return 'unknown'
+        
+        code = var_declaration.get('code', '')
+        # 提取类型（如：address public owner; -> address）
+        import re
+        match = re.search(r'(uint\d*|address|bool|string|bytes\d*|mapping\([^)]+\))', code)
+        if match:
+            return match.group(1)
+        return 'unknown'
+    
+    def _get_function_full_code(self, func_name: str, function_map: Dict) -> str:
+        """获取完整函数代码"""
+        if func_name in function_map:
+            func_info = function_map[func_name]
+            start = func_info['start_line'] - 1
+            end = func_info['end_line']
+            return ''.join(self.source_lines[start:end])
+        
+        # 如果找不到，尝试简单搜索
+        import re
+        for i, line in enumerate(self.source_lines):
+            if f'function {func_name}' in line or (func_name == 'constructor' and 'constructor' in line):
+                end = self._find_function_end(i + 1)
+                return ''.join(self.source_lines[i:end])
+        
+        return f"// 函数 {func_name} 未找到"
+    
+    def _extract_function_signature(self, func_name: str) -> str:
+        """提取函数签名"""
+        import re
+        for line in self.source_lines:
+            if f'function {func_name}' in line or (func_name == 'constructor' and 'constructor' in line):
+                # 提取到 { 之前的部分
+                signature = line.split('{')[0].strip()
+                return signature
+        return f"function {func_name}(...)"
+    
+    def _get_context_lines(self, line_num: int, context_size: int = 3) -> tuple:
+        """获取上下文代码行"""
+        before = []
+        after = []
+        
+        # 获取之前的行
+        for i in range(max(0, line_num - context_size - 1), line_num - 1):
+            if i < len(self.source_lines):
+                before.append(self.source_lines[i].rstrip())
+        
+        # 获取之后的行
+        for i in range(line_num, min(len(self.source_lines), line_num + context_size)):
+            if i < len(self.source_lines):
+                after.append(self.source_lines[i].rstrip())
+        
+        return before, after
+    
+    def _generate_vulnerability_description(self, variable: str, severity: str, 
+                                           vuln_type: str, location: Dict) -> str:
+        """生成漏洞描述"""
+        has_condition = location.get('has_bytecode_condition', False) or location.get('has_source_condition', False)
+        
+        if severity == 'critical':
+            if has_condition:
+                return f"变量'{variable}'被写入，虽有条件检查但可能不足以防止攻击"
+            else:
+                return f"关键变量'{variable}'被直接写入，函数无任何访问控制保护"
+        else:  # suspicious
+            return f"变量'{variable}'被写入，检测到条件判断但需人工验证是否充分"
+    
+    def _generate_attack_scenario(self, variable: str, func_name: str, severity: str) -> str:
+        """生成攻击场景描述"""
+        var_lower = variable.lower()
+        
+        if 'owner' in var_lower or 'admin' in var_lower:
+            return f"攻击者可以调用{func_name}函数并传入自己的地址，夺取合约控制权"
+        elif 'balance' in var_lower or 'amount' in var_lower:
+            return f"攻击者可能操纵资金相关变量，导致资金损失或账目混乱"
+        elif 'paused' in var_lower or 'stopped' in var_lower:
+            return f"攻击者可能修改合约状态控制变量，影响合约正常运行"
+        else:
+            return f"攻击者可以无限制地修改变量'{variable}'，影响合约业务逻辑"
+    
+    def _extract_data_flow_summary(self, location: Dict, variable: str, var_slot: int) -> str:
+        """提取数据流摘要"""
+        # 简化的数据流描述
+        return f"user_input -> SSTORE(slot_{var_slot}:{variable})"
+    
+    def _extract_existing_checks(self, func_name: str, function_map: Dict) -> List[Dict]:
+        """提取已有的检查"""
+        checks = []
+        if func_name in function_map:
+            func_info = function_map[func_name]
+            start = func_info['start_line'] - 1
+            end = func_info['end_line']
+            
+            for line in self.source_lines[start:end]:
+                if 'require(' in line:
+                    # 提取require条件
+                    import re
+                    match = re.search(r'require\(([^,)]+)', line)
+                    if match:
+                        condition = match.group(1).strip()
+                        checks.append({
+                            'type': 'require',
+                            'condition': condition,
+                            'purpose': self._infer_check_purpose(condition)
+                        })
+        
+        return checks
+    
+    def _infer_check_purpose(self, condition: str) -> str:
+        """推断检查的目的"""
+        condition_lower = condition.lower()
+        if 'msg.sender' in condition_lower and ('owner' in condition_lower or 'admin' in condition_lower):
+            return '访问控制检查'
+        elif '>' in condition or '<' in condition or '==' in condition:
+            return '数值范围检查'
+        elif '!= 0' in condition or '!= address(0)' in condition:
+            return '零值检查'
+        else:
+            return '条件检查'
+    
+    def _check_has_modifier(self, function_signature: str) -> bool:
+        """检查函数是否有modifier"""
+        common_modifiers = ['onlyOwner', 'onlyAdmin', 'whenNotPaused', 'nonReentrant']
+        return any(mod in function_signature for mod in common_modifiers)
+    
+    def _determine_confidence(self, location: Dict) -> str:
+        """确定检测置信度"""
+        detection_method = location.get('detection_method', 'taint_analysis')
+        has_bytecode_condition = location.get('has_bytecode_condition', False)
+        has_source_condition = location.get('has_source_condition', False)
+        
+        if detection_method == 'taint_analysis' and not has_bytecode_condition and not has_source_condition:
+            return 'high'
+        elif has_bytecode_condition or has_source_condition:
+            return 'medium'
+        else:
+            return 'low'
+    
+    def _generate_review_notes(self, variable: str, func_name: str) -> str:
+        """生成人工审查提示"""
+        var_lower = variable.lower()
+        
+        if 'balance' in var_lower or 'amount' in var_lower:
+            return f"需要确认{func_name}函数的业务逻辑：是owner专用操作还是用户余额系统？现有检查是否充分？"
+        elif 'owner' in var_lower or 'admin' in var_lower:
+            return f"虽然检测到条件判断，但需验证是否包含足够的访问控制（如msg.sender == owner）"
+        else:
+            return f"需要人工审查{func_name}函数的条件检查是否足以保护变量'{variable}'"
 

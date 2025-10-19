@@ -9,9 +9,9 @@ import json
 import csv
 from datetime import datetime
 
-ROOT_DIR = "analysis_output"
-SUMMARY_JSON = "analysis_summary.json"
-SUMMARY_CSV = "analysis_summary.csv"
+ROOT_DIR = "analysis_output_pretty_smart"
+SUMMARY_JSON = "analysis_summary_pretty_smart.json"
+SUMMARY_CSV = "analysis_summary_pretty_smart.csv"
 
 
 def read_json(path):

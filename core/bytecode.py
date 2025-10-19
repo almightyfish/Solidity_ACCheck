@@ -6,7 +6,8 @@
 
 import json
 import os
-from typing import List, Dict
+import subprocess
+from typing import List, Dict, Optional
 from utils.colors import Colors
 from utils.constants import EVM_OPCODES
 
@@ -14,10 +15,13 @@ from utils.constants import EVM_OPCODES
 class BytecodeAnalyzer:
     """字节码分析器"""
     
-    def __init__(self, bytecode: str, key_variables: List[str], output_dir: str):
+    def __init__(self, bytecode: str, key_variables: List[str], output_dir: str, 
+                 contract_source: Optional[str] = None, contract_name: Optional[str] = None):
         self.bytecode = bytecode
         self.key_variables = key_variables
         self.output_dir = output_dir
+        self.contract_source = contract_source  # 🔧 新增：合约源文件路径（用于获取存储布局）
+        self.contract_name = contract_name  # 🔧 新增：合约名称
         self.instructions = []
         self.basic_blocks = []
         self.cfg = {}
@@ -41,7 +45,17 @@ class BytecodeAnalyzer:
         self.match_key_vars_to_storage()
         print(f"✓ 变量存储映射:")
         for var, info in self.var_storage_map.items():
-            print(f"    {var} → slot {info.get('slot')}")
+            slot = info.get('slot', 'unknown')
+            var_type = info.get('type', 'unknown')
+            note = info.get('note', '')
+            
+            # 格式化输出
+            type_info = f"[{var_type}]" if var_type != 'unknown' else ''
+            slot_info = f"slot {slot}" if slot != -1 else "未找到"
+            
+            print(f"    {var} → {slot_info} {type_info}")
+            if note:
+                print(f"      ℹ️  {note}")
         
         # 🔧 新增：检测敏感操作
         sensitive_ops = self.detect_sensitive_opcodes()
@@ -199,9 +213,140 @@ class BytecodeAnalyzer:
         return None
     
     def match_key_vars_to_storage(self):
-        """映射变量到存储槽位"""
-        for idx, var in enumerate(self.key_variables):
-            self.var_storage_map[var] = {"slot": idx}
+        """
+        映射变量到存储槽位
+        🔧 改进：使用 solc --storage-layout 获取准确的存储布局
+        """
+        # 如果没有合约源文件，回退到简单映射
+        if not self.contract_source or not os.path.exists(self.contract_source):
+            print(f"  ⚠️  未提供合约源文件，使用简单索引映射（可能不准确）")
+            for idx, var in enumerate(self.key_variables):
+                self.var_storage_map[var] = {"slot": idx, "type": "unknown"}
+            return
+        
+        # 使用 solc 获取存储布局
+        storage_layout = self._get_storage_layout_from_solc()
+        
+        if not storage_layout:
+            print(f"  ⚠️  无法获取存储布局，使用简单索引映射")
+            for idx, var in enumerate(self.key_variables):
+                self.var_storage_map[var] = {"slot": idx, "type": "unknown"}
+            return
+        # 解析存储布局，映射关键变量
+        self._map_variables_from_layout(storage_layout)
+    
+    def _get_storage_layout_from_solc(self) -> Optional[Dict]:
+        """
+        🔧 新增：使用 solc 获取存储布局
+        
+        Returns:
+            存储布局字典，失败返回 None
+        """
+        try:
+            # 构建 solc 命令：--storage-layout
+            # 注意：--storage-layout 在 solc 0.5.13+ 版本才支持
+            cmd = [
+                'solc',
+                '--storage-layout',
+                '--combined-json', 'storage-layout',
+                self.contract_source
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            
+            if result.returncode != 0:
+                # 可能是旧版本不支持 --storage-layout
+                print(f"  ⚠️  solc --storage-layout 执行失败（可能版本过低，需要 0.5.13+）")
+                return None
+            
+            # 解析 JSON 输出
+            data = json.loads(result.stdout)
+            
+            # 找到对应的合约
+            contracts = data.get('contracts', {})
+            
+            # 查找包含当前合约的键
+            for contract_key, contract_data in contracts.items():
+                # contract_key 格式: "path:ContractName"
+                if self.contract_name and self.contract_name in contract_key:
+                    return contract_data.get('storage-layout', {})
+                elif self.contract_source in contract_key or os.path.basename(self.contract_source) in contract_key:
+                    return contract_data.get('storage-layout', {})
+            
+            # 如果只有一个合约，直接使用
+            if len(contracts) == 1:
+                return list(contracts.values())[0].get('storage-layout', {})
+            
+            return None
+            
+        except subprocess.TimeoutExpired:
+            print(f"  ⚠️  获取存储布局超时")
+            return None
+        except json.JSONDecodeError as e:
+            print(f"  ⚠️  解析存储布局JSON失败: {e}")
+            return None
+        except Exception as e:
+            print(f"  ⚠️  获取存储布局失败: {e}")
+            return None
+    
+    def _map_variables_from_layout(self, storage_layout: Dict):
+        """
+        🔧 新增：从存储布局中映射变量
+        
+        Args:
+            storage_layout: solc 返回的存储布局数据
+        """
+        storage_info = storage_layout.get('storage', [])
+        types_info = storage_layout.get('types', {})
+        
+        # 遍历所有存储变量
+        for var_info in storage_info:
+            var_name = var_info.get('label', '')
+            
+            # 检查是否是关键变量
+            if var_name in self.key_variables:
+                slot = var_info.get('slot', 0)
+                offset = var_info.get('offset', 0)
+                type_key = var_info.get('type', '')
+                
+                # 获取类型详细信息
+                type_detail = types_info.get(type_key, {})
+                type_label = type_detail.get('label', type_key)
+                type_encoding = type_detail.get('encoding', 'inplace')
+                
+                # 🔧 改进：检测是否为 mapping 或动态数组
+                is_mapping = 'mapping' in type_label.lower()
+                is_dynamic_array = type_encoding == 'dynamic_array'
+                
+                self.var_storage_map[var_name] = {
+                    'slot': slot,
+                    'offset': offset,
+                    'type': type_label,
+                    'type_encoding': type_encoding,
+                    'type_key': type_key,
+                    'is_mapping': is_mapping,  # 🔧 新增：标记是否为 mapping
+                    'is_dynamic_array': is_dynamic_array  # 🔧 新增：标记是否为动态数组
+                }
+                
+                # 对于 mapping 和动态数组，添加额外说明
+                if is_mapping:
+                    self.var_storage_map[var_name]['note'] = 'mapping类型，实际槽位需要通过keccak256(key, slot)计算'
+                    self.var_storage_map[var_name]['storage_pattern'] = 'keccak256_key_slot'  
+                elif is_dynamic_array:
+                    self.var_storage_map[var_name]['note'] = '动态数组，实际元素槽位需要通过keccak256(slot)计算'
+                    self.var_storage_map[var_name]['storage_pattern'] = 'keccak256_slot'  
+        
+        # 检查是否有未映射的关键变量
+        unmapped_vars = set(self.key_variables) - set(self.var_storage_map.keys())
+        if unmapped_vars:
+            print(f"  ⚠️  以下变量未在存储布局中找到: {', '.join(unmapped_vars)}")
+            # 为未映射的变量添加占位符
+            for var in unmapped_vars:
+                self.var_storage_map[var] = {
+                    'slot': -1,
+                    'type': 'not_found',
+                    'note': '未在合约存储布局中找到（可能是局部变量、常量或不存在）'
+                }
     
     def detect_sensitive_opcodes(self) -> List[Dict]:
         """
@@ -250,6 +395,7 @@ class BytecodeAnalyzer:
             'basic_blocks_count': len(self.basic_blocks),
             'cfg': self.cfg,
             'variable_storage_map': self.var_storage_map,
+            'sensitive_operations': self.sensitive_operations,  # 🔧 新增
             'instructions_sample': self.instructions[:20]
         }
         

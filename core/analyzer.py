@@ -5,7 +5,9 @@
 """
 
 import os
+import re
 from typing import List, Dict
+from pathlib import Path
 from utils.colors import Colors
 from .compiler import SolcManager, ContractCompiler
 from .bytecode import BytecodeAnalyzer
@@ -27,6 +29,34 @@ class AllInOneAnalyzer:
         # 创建输出目录
         os.makedirs(output_dir, exist_ok=True)
         os.makedirs(os.path.join(output_dir, "intermediate"), exist_ok=True)
+    
+    def _extract_contract_name(self) -> str:
+        """
+        提取合约名称
+        
+        Returns:
+            合约名称，如果找不到则返回文件名
+        """
+        try:
+            with open(self.contract_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            # 查找第一个非interface的contract声明
+            matches = re.findall(r'\bcontract\s+(\w+)', content)
+            for match in matches:
+                # 排除interface
+                line = [line for line in content.split('\n') if f'contract {match}' in line][0]
+                if 'interface' not in line:
+                    return match
+            
+            # 如果都是interface，返回第一个
+            if matches:
+                return matches[0]
+            
+            # 找不到，使用文件名
+            return Path(self.contract_path).stem
+        except:
+            return Path(self.contract_path).stem
     
     def run(self) -> Dict:
         """运行完整分析流程"""
@@ -51,10 +81,13 @@ class AllInOneAnalyzer:
                 return None
             
             # 步骤3: 字节码分析
+            # 🔧 改进：传递合约源文件和名称，用于获取存储布局
             bytecode_analyzer = BytecodeAnalyzer(
                 compiler.runtime_bytecode,
                 self.key_variables,
-                self.output_dir
+                self.output_dir,
+                contract_source=self.contract_path,  # 🔧 新增
+                contract_name=self._extract_contract_name()  # 🔧 新增
             )
             if not bytecode_analyzer.analyze():
                 return None

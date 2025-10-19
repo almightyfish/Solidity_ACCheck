@@ -14,7 +14,7 @@ from core.analyzer import AllInOneAnalyzer
 JSONL_PATH = "/Users/almightyfish/Desktop/AChecker/AC/solidity_analysis_deepseek_with_llm_longtail.jsonl"
 
 # 输出目录根路径
-OUTPUT_ROOT = "analysis_output_2"
+OUTPUT_ROOT = "analysis_output_scvhunter"
 
 # Solidity 版本匹配正则
 PRAGMA_PATTERN = re.compile(r"pragma\s+solidity\s+(\^?\d+\.\d+\.\d+)", re.IGNORECASE)
@@ -22,6 +22,22 @@ PRAGMA_PATTERN = re.compile(r"pragma\s+solidity\s+(\^?\d+\.\d+\.\d+)", re.IGNORE
 # JSON 匹配正则：提取 llm_response_raw 中的结构体
 JSON_EXTRACT_PATTERN = re.compile(r"\{.*?\}", re.DOTALL)
 
+def extract_solc_version_anywhere(sol_file: str):
+    """
+    遍历整个sol文件找是否存在solidity版本指定（pragma solidity ...），
+    因为solidity版本不一定在文件开头指出
+    """
+    try:
+        with open(sol_file, "r", encoding="utf-8") as f:
+            content = f.read()
+            matches = PRAGMA_PATTERN.findall(content)
+            if matches:
+                # 返回找到的第一个版本，并去除开头的 ^ 或 >= 等
+                version = matches[0].lstrip("^>=")
+                return version
+    except Exception as e:
+        print(f"⚠️ 无法读取 {sol_file}: {e}")
+    return None
 
 def extract_solc_version(sol_file: str):
     """从源码文件中提取 Solidity 版本"""

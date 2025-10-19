@@ -340,6 +340,11 @@ class SourceMapper:
                                 # view/pure函数不能修改状态，里面的赋值是给返回值赋值
                                 # 例如：function getPet(...) view returns (uint256 genes) { genes = pet.genes; }
                                 continue
+                            
+                            # 🔧 新增：跳过有访问控制修饰符的函数
+                            # 如果函数使用了onlyOwner、onlyAdmin等修饰符，说明已有保护，不标记为疑似路径
+                            if self._has_access_control_modifier(func_name):
+                                continue
                         
                         # 🔧 新方法：利用字节码分析的路径条件信息（增强版）
                         # 检查是否所有包含此写入的污点路径都有条件判断
@@ -418,6 +423,11 @@ class SourceMapper:
                         # 🔧 新增：跳过view/pure函数
                         if self._is_view_or_pure_function(func_name):
                             # view/pure函数不修改状态
+                            continue
+                        
+                        # 🔧 新增：跳过有访问控制修饰符的函数
+                        # 如果函数使用了onlyOwner、onlyAdmin等修饰符，说明已有保护，不标记为疑似路径
+                        if self._has_access_control_modifier(func_name):
                             continue
                         
                         # 检查是否是public函数且无访问控制
@@ -512,12 +522,22 @@ class SourceMapper:
         else:
             print(f"{Colors.GREEN}✓ 未发现敏感函数调用{Colors.ENDC}")
         
+        # 🔧 新增：获取污点到敏感函数的流分析结果
+        taint_to_sensitive = []
+        if hasattr(bytecode_analyzer, 'taint_to_sensitive_flows'):
+            taint_to_sensitive = getattr(bytecode_analyzer, 'taint_to_sensitive_flows', [])
+        # 如果在污点分析器中
+        taint_analyzer_flows = self._get_taint_to_sensitive_flows()
+        if taint_analyzer_flows:
+            taint_to_sensitive = taint_analyzer_flows
+        
         print(f"\n{Colors.GREEN}✓ 源码映射完成{Colors.ENDC}")
         print(f"  - 映射变量: {len(mapped_results)} 个")
         print(f"  - 敏感函数: {len(sensitive_functions)} 个")
+        print(f"  - 污点到敏感函数的流: {len(taint_to_sensitive)} 条")
         
-        # 保存结果（包含敏感函数信息）
-        self._save_mapped_results(mapped_results, sensitive_functions)
+        # 保存结果（包含敏感函数信息和污点流）
+        self._save_mapped_results(mapped_results, sensitive_functions, taint_to_sensitive)
         
         return mapped_results
     
@@ -676,12 +696,23 @@ class SourceMapper:
                     return True, "非public函数"
                 
                 # 检查是否有访问控制modifier
-                # 🔧 改进：使用更灵活的模式匹配
+                # 🔧 改进：使用更全面的模式匹配
                 access_control_patterns = [
-                    'onlyOwner', 'onlyAdmin', 'only', 'ownerOnly',
-                    'isOwner', 'isAdmin', 'is',  # 🔧 新增：isOwner(), isAdmin()等
-                    'whenNotPaused', 'whenPaused',
-                    'nonReentrant', 'senderIsOwner'
+                    # 常见的owner相关修饰符
+                    'onlyOwner', 'onlyowner', 'ownerOnly', 'OwnerOnly',
+                    # admin相关修饰符
+                    'onlyAdmin', 'onlyadmin', 'adminOnly', 'AdminOnly',
+                    # 其他通用访问控制修饰符
+                    'onlyAuthorized', 'onlyMinter', 'onlyBurner', 'onlyGovernance',
+                    'onlyController', 'onlyManager', 'onlyWhitelisted',
+                    # is开头的检查
+                    'isOwner', 'isAdmin', 'isAuthorized', 'isMinter',
+                    # 状态控制修饰符
+                    'whenNotPaused', 'whenPaused', 'notPaused',
+                    # 安全相关修饰符
+                    'nonReentrant', 'noReentrancy', 'reentrancyGuard',
+                    # 其他常见模式
+                    'senderIsOwner', 'onlyBy', 'restricted', 'protected'
                 ]
                 if any(modifier in line for modifier in access_control_patterns):
                     return True, f"有访问控制modifier"
@@ -867,12 +898,23 @@ class SourceMapper:
         if func_name:
             for line in self.source_lines:
                 if f'function {func_name}' in line:
-                    # 🔧 改进：检查常见的访问控制modifier
+                    # 🔧 改进：检查常见的访问控制modifier（更全面的模式）
                     access_control_patterns = [
-                        'onlyOwner', 'onlyAdmin', 'only', 'ownerOnly',
-                        'isOwner', 'isAdmin', 'is',  # 🔧 新增：isOwner(), isAdmin()等
-                        'whenNotPaused', 'whenPaused',
-                        'nonReentrant', 'senderIsOwner'
+                        # 常见的owner相关修饰符
+                        'onlyOwner', 'onlyowner', 'ownerOnly', 'OwnerOnly',
+                        # admin相关修饰符
+                        'onlyAdmin', 'onlyadmin', 'adminOnly', 'AdminOnly',
+                        # 其他通用访问控制修饰符
+                        'onlyAuthorized', 'onlyMinter', 'onlyBurner', 'onlyGovernance',
+                        'onlyController', 'onlyManager', 'onlyWhitelisted',
+                        # is开头的检查
+                        'isOwner', 'isAdmin', 'isAuthorized', 'isMinter',
+                        # 状态控制修饰符
+                        'whenNotPaused', 'whenPaused', 'notPaused',
+                        # 安全相关修饰符
+                        'nonReentrant', 'noReentrancy', 'reentrancyGuard',
+                        # 其他常见模式
+                        'senderIsOwner', 'onlyBy', 'restricted', 'protected'
                     ]
                     if any(modifier in line for modifier in access_control_patterns):
                         return True
@@ -928,6 +970,52 @@ class SourceMapper:
         
         return False
     
+    def _has_access_control_modifier(self, func_name: str) -> bool:
+        """
+        🔧 新增：专门检测函数是否使用了访问控制修饰符
+        
+        如果函数使用了onlyOwner、onlyAdmin等修饰符，返回True
+        这种情况下不应该标记为疑似或危险路径
+        
+        Args:
+            func_name: 函数名称
+        
+        Returns:
+            True: 有访问控制修饰符，安全
+            False: 无访问控制修饰符
+        """
+        if not func_name:
+            return False
+        
+        # 定义访问控制修饰符模式（与上面保持一致）
+        access_control_patterns = [
+            # 常见的owner相关修饰符
+            'onlyOwner', 'onlyowner', 'ownerOnly', 'OwnerOnly',
+            # admin相关修饰符
+            'onlyAdmin', 'onlyadmin', 'adminOnly', 'AdminOnly',
+            # 其他通用访问控制修饰符
+            'onlyAuthorized', 'onlyMinter', 'onlyBurner', 'onlyGovernance',
+            'onlyController', 'onlyManager', 'onlyWhitelisted',
+            # is开头的检查
+            'isOwner', 'isAdmin', 'isAuthorized', 'isMinter',
+            # 状态控制修饰符
+            'whenNotPaused', 'whenPaused', 'notPaused',
+            # 安全相关修饰符
+            'nonReentrant', 'noReentrancy', 'reentrancyGuard',
+            # 其他常见模式
+            'senderIsOwner', 'onlyBy', 'restricted', 'protected'
+        ]
+        
+        # 在源码中查找函数定义
+        for line in self.source_lines:
+            if f'function {func_name}' in line:
+                # 检查是否包含任何访问控制modifier
+                if any(modifier in line for modifier in access_control_patterns):
+                    return True
+                break
+        
+        return False
+    
     def _calculate_confidence(self, has_bytecode_condition: bool, has_source_condition: bool, 
                              bytecode_condition_types: List[str]) -> str:
         """
@@ -973,14 +1061,31 @@ class SourceMapper:
         
         return 'low'
     
-    def _save_mapped_results(self, results: List[Dict], sensitive_functions: List[Dict] = None):
-        """保存映射结果（包含敏感函数信息）"""
+    def _get_taint_to_sensitive_flows(self) -> List[Dict]:
+        """
+        🔧 新增：从中间文件读取污点到敏感函数的流分析结果
+        """
+        flow_file = os.path.join(self.output_dir, "intermediate", "taint_to_sensitive_flows.json")
+        if os.path.exists(flow_file):
+            try:
+                with open(flow_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    return data.get('flows', [])
+            except:
+                pass
+        return []
+    
+    def _save_mapped_results(self, results: List[Dict], 
+                            sensitive_functions: List[Dict] = None,
+                            taint_to_sensitive: List[Dict] = None):
+        """保存映射结果（包含敏感函数信息和污点流）"""
         output_file = os.path.join(self.output_dir, "intermediate", "source_mapping.json")
         
-        # 🔧 新增：将敏感函数信息一起保存
+        # 🔧 新增：将敏感函数信息和污点流一起保存
         data_to_save = {
             'mapped_results': results,
-            'sensitive_functions': sensitive_functions or []
+            'sensitive_functions': sensitive_functions or [],
+            'taint_to_sensitive_flows': taint_to_sensitive or []  # 🔧 新增
         }
         
         with open(output_file, 'w', encoding='utf-8') as f:
